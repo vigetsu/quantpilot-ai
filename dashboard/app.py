@@ -186,7 +186,8 @@ ol_health = ollama.health()
 
 # ------------------------------------------------------------------ top bar
 p_alp = f"<span class='qp-pill {'ok' if alpaca_ok else 'warn'}'>Alpaca: {'PAPER Bağlı' if alpaca_ok else 'DEMO Modu'}</span>"
-p_ol = f"<span class='qp-pill {'ok' if (ol_health['online'] and ol_health['model_available']) else 'warn'}'>Ollama ({settings.ollama_model}): {'Aktif' if (ol_health['online'] and ol_health['model_available']) else 'Çevrimdışı'}</span>"
+_ai_label = f"Ollama ({settings.ollama_model}): Aktif" if ol_health.get("mode") == "ollama" else ("AI Analiz: Aktif" if (ol_health["online"] and ol_health["model_available"]) else f"Ollama ({settings.ollama_model}): Çevrimdışı")
+p_ol = f"<span class='qp-pill {'ok' if (ol_health['online'] and ol_health['model_available']) else 'warn'}'>{_ai_label}</span>"
 p_mkt = f"<span class='qp-pill {'ok' if (session and session.is_open) else 'neu'}'>ABD Piyasası: {market_status_text(session) if session else 'DEMO'}</span>"
 p_wrk = f"<span class='qp-pill {'ok' if w_alive else 'warn'}'>Worker: {w_text}</span>"
 p_auto = f"<span class='qp-pill {'ok' if (db.flag('auto_trading') and not db.flag('emergency_stop')) else 'bad'}'>Oto. Paper Emir: {'AÇIK' if (db.flag('auto_trading') and not db.flag('emergency_stop')) else 'KAPALI'}</span>"
