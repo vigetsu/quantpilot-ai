@@ -1,16 +1,16 @@
 name: QuantPilot AI - 24/7 Cloud Paper Trader
 
-on:
-  # Hafta ici ABD borsasi saatlerinde (13:30 - 21:00 UTC) her 15 dakikada bir otomatik calisir
+"on":
   schedule:
     - cron: "*/15 13-21 * * 1-5"
-  # Istediginiz zaman GitHub uzerinden "Run workflow" tusuyla manuel de tetikleyebilirsiniz
   workflow_dispatch:
     inputs:
       force_eval:
-        description: "Piyasa kapali olsa bile sinyal taramasini zorla (emir gondermez)"
+        description: "Piyasa kapali olsa bile sinyal taramasini zorla"
         required: false
         default: "true"
+  push:
+    branches: ["master", "main"]
 
 concurrency:
   group: quantpilot-paper-worker
