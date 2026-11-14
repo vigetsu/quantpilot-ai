@@ -21,6 +21,9 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 from dashboard.mock_data import demo_bars, demo_bundle  # noqa: E402
+import importlib
+import quantpilot.ai.ollama_client as _oc_mod
+importlib.reload(_oc_mod)
 from quantpilot.ai.ollama_client import OllamaClient, portfolio_prompt  # noqa: E402
 from quantpilot.analytics.performance import (  # noqa: E402
     MIN_OBS_FOR_SHARPE,
