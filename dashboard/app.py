@@ -36,6 +36,7 @@ from quantpilot.config import ConfigError, load_settings  # noqa: E402
 from quantpilot.data.market_data import MarketData  # noqa: E402
 from quantpilot.data.universe import validate_watchlist  # noqa: E402
 from quantpilot.db import HARD_LIMITS, Database  # noqa: E402
+from quantpilot.embedded_worker import ensure_embedded_worker  # noqa: E402
 from quantpilot.engine import TradingEngine, safety_gate  # noqa: E402
 from quantpilot.ml.model import ModelTrainer, load_active_predictor  # noqa: E402
 from quantpilot.risk.selftest import run_self_test  # noqa: E402
@@ -137,6 +138,24 @@ except ConfigError as exc:
     st.error(f"Yapılandırma güvenlik hatası: {exc}")
     st.stop()
 
+import os as _os
+_dash_pw = _os.environ.get("DASHBOARD_PASSWORD", "")
+if not _dash_pw:
+    try:
+        _dash_pw = str(st.secrets.get("DASHBOARD_PASSWORD", ""))
+    except Exception:
+        _dash_pw = ""
+if _dash_pw and not st.session_state.get("pw_ok"):
+    st.markdown("<div class='qp-topbar'><div class='qp-brand'>🔒 QuantPilot AI — Giriş Koruması</div></div>", unsafe_allow_html=True)
+    _entered = st.text_input("Panel Şifresi", type="password")
+    if st.button("Giriş Yap", type="primary"):
+        if _entered == _dash_pw:
+            st.session_state["pw_ok"] = True
+            st.rerun()
+        else:
+            st.error("Hatalı şifre.")
+    st.stop()
+
 db = Database(settings.db_path)
 ollama = OllamaClient(settings.ollama_url, settings.ollama_model, settings.ollama_timeout)
 broker: AlpacaBroker | None = None
@@ -153,6 +172,7 @@ if settings.has_credentials:
             if not db.watchlist(only_valid=True):
                 validate_watchlist(broker, db)
             st.session_state["boot_synced"] = True
+        ensure_embedded_worker(settings, db, broker, md, ollama)
         alpaca_ok = True
         alpaca_msg = "PAPER hesabına bağlı"
     except Exception as exc:  # noqa: BLE001

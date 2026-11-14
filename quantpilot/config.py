@@ -99,7 +99,18 @@ def load_settings(env_file: Path | None = None, require_credentials: bool = Fals
         load_dotenv(env_path, override=False)
 
     def g(name: str, default: str = "") -> str:
-        return os.environ.get(name, default)
+        val = os.environ.get(name, "")
+        if val:
+            return val
+        try:
+            import streamlit as st
+            if name in st.secrets:
+                sval = str(st.secrets[name])
+                os.environ[name] = sval
+                return sval
+        except Exception:
+            pass
+        return default
 
     settings = Settings(
         api_key=Secret(g("ALPACA_API_KEY")),
