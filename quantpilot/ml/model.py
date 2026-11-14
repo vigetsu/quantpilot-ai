@@ -99,10 +99,10 @@ class ModelTrainer:
         oos_df = pd.concat(oos, ignore_index=True)
         overall = _metrics(oos_df["label"].values.astype(int), oos_df["prob"].values)
         # calibration table (reliability) on OOS predictions
-        bins = pd.cut(oos_df["prob"], bins=[0, .3, .4, .45, .5, .55, .6, .7, 1.0], include_lowest=True)
+        bins = pd.cut(oos_df["prob"], bins=[0, .3, .4, .45, .5, .55, .6, .7, 1.0], include_lowest=True).rename("bin")
         calib = oos_df.groupby(bins, observed=True).agg(mean_prob=("prob", "mean"), freq=("label", "mean"),
                                                          n=("label", "size")).reset_index()
-        calib["bin"] = calib["prob"].astype(str) if "prob" in calib else calib.iloc[:, 0].astype(str)
+        calib["bin"] = calib["bin"].astype(str)
         metrics = {"kind": kind, "oos_overall": overall, "folds": fold_metrics,
                    "calibration": calib[["bin", "mean_prob", "freq", "n"]].to_dict("records")}
         return metrics, oos_df, folds
