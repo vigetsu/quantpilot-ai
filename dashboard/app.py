@@ -23,8 +23,12 @@ sys.path.insert(0, str(ROOT))
 from dashboard.mock_data import demo_bars, demo_bundle  # noqa: E402
 import importlib
 import quantpilot.ai.ollama_client as _oc_mod
+import quantpilot.engine as _eng_mod
+import quantpilot.embedded_worker as _ew_mod
 importlib.reload(_oc_mod)
-from quantpilot.ai.ollama_client import OllamaClient, portfolio_prompt  # noqa: E402
+importlib.reload(_eng_mod)
+importlib.reload(_ew_mod)
+from quantpilot.ai.ollama_client import OllamaClient, portfolio_prompt, signal_prompt  # noqa: E402
 from quantpilot.analytics.performance import (  # noqa: E402
     MIN_OBS_FOR_SHARPE,
     drawdown_series,
@@ -450,7 +454,21 @@ with tabs[3]:
                 st.rerun()
     with col_ai2:
         st.markdown("**Son AI Açıklamaları (Danışma Amaçlı)**")
+        db.execute("DELETE FROM ai_analyses WHERE ok=0 OR content LIKE 'AI çevrimdışı%'")
         ais = db.recent_ai(limit=8)
+        if not ais and sigs:
+            for _s in sigs:
+                _ind = json.loads(_s.get("indicators") or "{}")
+                _rsn = json.loads(_s.get("reasons") or "[]")
+                _rn = json.loads(_s.get("risk_notes") or "[]")
+                _ok, _txt, _lat = ollama.chat(signal_prompt(_s["symbol"], _s["action"], _ind, _s.get("ml_prob"), _rsn, [], _rn))
+                db.add_ai_analysis("signal", _s["symbol"], settings.ollama_model, _ok, _txt, _lat)
+            _summary = {"ozsermaye": equity, "nakit": acct.get("cash"), "bugun_kz": today_pl,
+                        "pozisyonlar": positions, "son_sinyaller": [
+                            {"hisse": s["symbol"], "karar": s["action"], "ml": s.get("ml_prob")} for s in sigs]}
+            _ok, _ptxt, _lat = ollama.chat(portfolio_prompt(_summary))
+            db.add_ai_analysis("portfolio", None, settings.ollama_model, _ok, _ptxt, _lat)
+            ais = db.recent_ai(limit=8)
         if not ais:
             st.caption("Henüz AI analizi kaydedilmedi.")
         for a in ais:
