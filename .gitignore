@@ -4,8 +4,8 @@ __pycache__/
 /.pytest_cache/
 /.env
 /streamlit_secrets_kopyala.txt
-/data/
+/data/*.lock
+/data/*-shm
+/data/*-wal
 /logs/
-/models/*.joblib
-/models/*.csv
-/models/*.json
+
