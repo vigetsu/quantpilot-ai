@@ -1,0 +1,56 @@
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap');
+
+html, body, [class*="css"] {
+    font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+}
+.stApp {
+    background: radial-gradient(ellipse at top, #0f1729 0%, #090d16 65%);
+    color: #e5e7eb;
+}
+header[data-testid="stHeader"] { background: transparent; }
+section[data-testid="stSidebar"] {
+    background: #0b101c;
+    border-right: 1px solid #1e293b;
+}
+.qp-topbar {
+    display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 12px;
+    background: linear-gradient(90deg, #0f172a 0%, #111827 100%);
+    border: 1px solid #1e293b; border-radius: 12px; padding: 14px 20px; margin-bottom: 14px;
+}
+.qp-brand { font-size: 1.25rem; font-weight: 700; letter-spacing: -0.02em; color: #f8fafc; }
+.qp-sub { font-size: 0.78rem; color: #94a3b8; }
+.qp-pills { display: flex; gap: 8px; flex-wrap: wrap; }
+.qp-pill {
+    font-family: 'JetBrains Mono', monospace; font-size: 0.73rem; font-weight: 600;
+    padding: 5px 10px; border-radius: 999px; border: 1px solid #334155; background: #0f172a; color: #cbd5e1;
+}
+.qp-pill.paper { border-color: #38bdf8; color: #38bdf8; background: rgba(56,189,248,0.1); }
+.qp-pill.ok    { border-color: #10b981; color: #34d399; background: rgba(16,185,129,0.1); }
+.qp-pill.warn  { border-color: #f59e0b; color: #fbbf24; background: rgba(245,158,11,0.12); }
+.qp-pill.bad   { border-color: #ef4444; color: #f87171; background: rgba(239,68,68,0.14); }
+
+.qp-banner {
+    border-radius: 10px; padding: 12px 16px; margin-bottom: 12px; font-size: 0.86rem; line-height: 1.45;
+}
+.qp-banner.demo { background: rgba(245,158,11,0.13); border: 1px solid #f59e0b; color: #fde68a; }
+.qp-banner.stop { background: rgba(239,68,68,0.16); border: 1px solid #ef4444; color: #fecaca; font-weight: 600; }
+.qp-banner.info { background: rgba(56,189,248,0.09); border: 1px solid #1e3a5f; color: #bae6fd; }
+
+.qp-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(195px, 1fr)); gap: 12px; margin: 10px 0 18px; }
+.qp-card {
+    background: #0f1626; border: 1px solid #1e293b; border-radius: 11px; padding: 14px 16px;
+    transition: border-color .15s ease;
+}
+.qp-card:hover { border-color: #334155; }
+.qp-label { font-size: 0.74rem; text-transform: uppercase; letter-spacing: 0.06em; color: #94a3b8; margin-bottom: 6px; }
+.qp-val { font-family: 'JetBrains Mono', monospace; font-size: 1.32rem; font-weight: 600; color: #f8fafc; }
+.qp-delta { font-family: 'JetBrains Mono', monospace; font-size: 0.78rem; margin-top: 4px; color: #94a3b8; }
+.pos { color: #34d399 !important; }
+.neg { color: #f87171 !important; }
+.neu { color: #cbd5e1 !important; }
+.qp-tag {
+    display: inline-block; font-family: 'JetBrains Mono', monospace; font-size: 0.7rem;
+    padding: 2px 8px; border-radius: 5px; border: 1px solid #334155; color: #94a3b8; margin-left: 6px;
+}
+.qp-section { font-size: 1.02rem; font-weight: 600; color: #f1f5f9; margin: 14px 0 6px; }
+div[data-testid="stTabs"] button { font-weight: 600; }

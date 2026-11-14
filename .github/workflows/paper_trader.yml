@@ -1,0 +1,56 @@
+name: QuantPilot AI - 24/7 Cloud Paper Trader
+
+on:
+  # Hafta ici ABD borsasi saatlerinde (13:30 - 21:00 UTC) her 15 dakikada bir otomatik calisir
+  schedule:
+    - cron: "*/15 13-21 * * 1-5"
+  # Istediginiz zaman GitHub uzerinden "Run workflow" tusuyla manuel de tetikleyebilirsiniz
+  workflow_dispatch:
+    inputs:
+      force_eval:
+        description: "Piyasa kapali olsa bile sinyal taramasini zorla (emir gondermez)"
+        required: false
+        default: "true"
+
+concurrency:
+  group: quantpilot-paper-worker
+  cancel-in-progress: false
+
+jobs:
+  trade:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Kodu indir
+        uses: actions/checkout@v4
+
+      - name: Python 3.12 kur
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Bagimliliklari yukle
+        run: pip install -r requirements.txt
+
+      - name: Veritabani ve ML model onbellegini geri yukle
+        uses: actions/cache@v4
+        with:
+          path: |
+            data
+            models
+          key: qp-state-${{ github.run_number }}
+          restore-keys: |
+            qp-state-
+
+      - name: QuantPilot AI Paper Trading dongusunu calistir
+        env:
+          ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
+          ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
+          ALPACA_PAPER: "true"
+          ALPACA_BASE_URL: "https://paper-api.alpaca.markets"
+          ALPACA_DATA_FEED: "iex"
+          ALPACA_HISTORICAL_FEED: "sip"
+          QP_CLOUD_AUTO: "true"
+          QP_FORCE_EVAL: ${{ github.event.inputs.force_eval || 'false' }}
+        run: python -m quantpilot.cloud_run

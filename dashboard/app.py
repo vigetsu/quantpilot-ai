@@ -1,0 +1,639 @@
+"""QuantPilot AI — Streamlit Dashboard (Turkish UI, dark terminal theme).
+
+Run with: start_dashboard.bat  (or: streamlit run dashboard/app.py)
+The trading worker runs in a separate process (start_bot.bat) so closing this browser tab
+does NOT stop trading. When no Alpaca keys are present in .env, the dashboard shows clearly
+labeled DEMO data so you can explore the interface before connecting your paper account.
+"""
+from __future__ import annotations
+
+import json
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import plotly.graph_objects as go
+import streamlit as st
+
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))
+
+from dashboard.mock_data import demo_bars, demo_bundle  # noqa: E402
+from quantpilot.ai.ollama_client import OllamaClient, portfolio_prompt  # noqa: E402
+from quantpilot.analytics.performance import (  # noqa: E402
+    MIN_OBS_FOR_SHARPE,
+    drawdown_series,
+    equity_metrics,
+    fifo_realized,
+    trade_stats,
+)
+from quantpilot.backtest.runner import run_and_store  # noqa: E402
+from quantpilot.broker.alpaca_client import AlpacaBroker  # noqa: E402
+from quantpilot.broker.sync import OPEN_STATUSES, Synchronizer  # noqa: E402
+from quantpilot.config import ConfigError, load_settings  # noqa: E402
+from quantpilot.data.market_data import MarketData  # noqa: E402
+from quantpilot.data.universe import validate_watchlist  # noqa: E402
+from quantpilot.db import HARD_LIMITS, Database  # noqa: E402
+from quantpilot.engine import TradingEngine, safety_gate  # noqa: E402
+from quantpilot.ml.model import ModelTrainer, load_active_predictor  # noqa: E402
+from quantpilot.risk.selftest import run_self_test  # noqa: E402
+from quantpilot.scheduler.calendar import get_session, market_status_text  # noqa: E402
+
+st.set_page_config(page_title="QuantPilot AI — NASDAQ Paper Trader", page_icon="📈", layout="wide",
+                   initial_sidebar_state="expanded")
+st.markdown(f"<style>{(Path(__file__).parent / 'theme.css').read_text(encoding='utf-8')}</style>",
+            unsafe_allow_html=True)
+
+
+# ------------------------------------------------------------------ formatting
+def usd(x: float | None, signed: bool = False) -> str:
+    if x is None or (isinstance(x, float) and np.isnan(x)):
+        return "—"
+    s = "+" if signed and x > 0 else ("-" if x < 0 else "")
+    return f"{s}${abs(x):,.2f}"
+
+
+def pct(x: float | None, signed: bool = False) -> str:
+    if x is None or (isinstance(x, float) and np.isnan(x)):
+        return "—"
+    s = "+" if signed and x > 0 else ""
+    return f"{s}{x * 100:.2f}%"
+
+
+def cls(x: float | None) -> str:
+    if x is None or (isinstance(x, float) and np.isnan(x)) or abs(x) < 1e-9:
+        return "neu"
+    return "pos" if x > 0 else "neg"
+
+
+def card(label: str, val: str, delta: str = "", c: str = "neu", tag: str = "") -> str:
+    t = f"<span class='qp-tag'>{tag}</span>" if tag else ""
+    d = f"<div class='qp-delta {c}'>{delta}</div>" if delta else ""
+    return f"<div class='qp-card'><div class='qp-label'>{label}{t}</div><div class='qp-val {c}'>{val}</div>{d}</div>"
+
+
+def dark_fig(height: int = 340) -> go.Figure:
+    fig = go.Figure()
+    fig.update_layout(template="plotly_dark", height=height, margin=dict(l=16, r=16, t=28, b=24),
+                      paper_bgcolor="#0f1626", plot_bgcolor="#0f1626",
+                      font=dict(family="Inter, sans-serif", size=12, color="#cbd5e1"),
+                      legend=dict(orientation="h", y=1.08, x=0))
+    fig.update_xaxes(gridcolor="#1e293b")
+    fig.update_yaxes(gridcolor="#1e293b")
+    return fig
+
+
+def worker_alive(db: Database) -> tuple[bool, str]:
+    hb = db.get_state("worker_heartbeat")
+    if not hb:
+        return False, "Kapalı"
+    try:
+        dt = (datetime.now(timezone.utc) - datetime.fromisoformat(hb)).total_seconds()
+        return (dt < 90), (f"Aktif ({int(dt)} sn önce)" if dt < 90 else f"Yanıt yok ({int(dt)} sn)")
+    except Exception:
+        return False, "Bilinmiyor"
+
+
+def dispatch(db: Database, broker: AlpacaBroker | None, md: MarketData | None, ollama: OllamaClient,
+             settings, cmd: str, payload: dict | None = None) -> str:
+    """If the background worker is running, queue the command; otherwise execute immediately in-process."""
+    alive, _ = worker_alive(db)
+    if alive:
+        db.enqueue_command(cmd, payload)
+        return "Komut çalışan worker'a iletildi (1-3 sn içinde uygulanır)."
+    if cmd == "start":
+        db.set_state("bot_running", True)
+        return "Bot durumu 'Başlatıldı' olarak kaydedildi. Otomatik döngü için start_bot.bat çalıştırın."
+    if cmd == "pause":
+        db.set_state("bot_running", False)
+        return "Bot duraklatıldı."
+    if cmd == "clear_emergency":
+        db.set_state("emergency_stop", False)
+        return "Acil durdurma kaldırıldı (otomatik emirler güvenlik için kapalı bırakıldı)."
+    if not broker:
+        return "Alpaca anahtarları yapılandırılmadı (.env)."
+    eng = TradingEngine(settings, db, broker, md, ollama)
+    if cmd == "emergency_stop":
+        return eng.exec.emergency_stop(close_positions=bool((payload or {}).get("close_positions")))
+    if cmd == "sync":
+        Synchronizer(broker, db).sync_all()
+        return "Alpaca paper hesabı senkronize edildi."
+    if cmd == "validate_watchlist":
+        validate_watchlist(broker, db)
+        return "İzleme listesi NASDAQ/aktif/işlem yapılabilir kriterlerine göre doğrulandı."
+    if cmd == "run_cycle":
+        res = eng.run_cycle(force_eval=True)
+        return f"Değerlendirme tamamlandı ({len(res.get('signals', []))} sinyal)."
+    return "Komut işlendi."
+
+
+# ------------------------------------------------------------------ bootstrap
+try:
+    settings = load_settings(require_credentials=False)
+    config_err = None
+except ConfigError as exc:
+    st.error(f"Yapılandırma güvenlik hatası: {exc}")
+    st.stop()
+
+db = Database(settings.db_path)
+ollama = OllamaClient(settings.ollama_url, settings.ollama_model, settings.ollama_timeout)
+broker: AlpacaBroker | None = None
+md: MarketData | None = None
+alpaca_ok = False
+alpaca_msg = "API anahtarları girilmedi (.env)"
+
+if settings.has_credentials:
+    try:
+        broker = AlpacaBroker(settings)
+        md = MarketData(settings)
+        if "boot_synced" not in st.session_state:
+            Synchronizer(broker, db).sync_all()
+            if not db.watchlist(only_valid=True):
+                validate_watchlist(broker, db)
+            st.session_state["boot_synced"] = True
+        alpaca_ok = True
+        alpaca_msg = "PAPER hesabına bağlı"
+    except Exception as exc:  # noqa: BLE001
+        alpaca_msg = f"Bağlantı hatası: {exc}"
+
+demo_mode = not alpaca_ok
+demo = demo_bundle() if demo_mode else None
+session = get_session(broker) if broker else None
+w_alive, w_text = worker_alive(db)
+ol_health = ollama.health()
+
+# ------------------------------------------------------------------ top bar
+p_alp = f"<span class='qp-pill {'ok' if alpaca_ok else 'warn'}'>Alpaca: {'PAPER Bağlı' if alpaca_ok else 'DEMO Modu'}</span>"
+p_ol = f"<span class='qp-pill {'ok' if (ol_health['online'] and ol_health['model_available']) else 'warn'}'>Ollama ({settings.ollama_model}): {'Aktif' if (ol_health['online'] and ol_health['model_available']) else 'Çevrimdışı'}</span>"
+p_mkt = f"<span class='qp-pill {'ok' if (session and session.is_open) else 'neu'}'>ABD Piyasası: {market_status_text(session) if session else 'DEMO'}</span>"
+p_wrk = f"<span class='qp-pill {'ok' if w_alive else 'warn'}'>Worker: {w_text}</span>"
+p_auto = f"<span class='qp-pill {'ok' if (db.flag('auto_trading') and not db.flag('emergency_stop')) else 'bad'}'>Oto. Paper Emir: {'AÇIK' if (db.flag('auto_trading') and not db.flag('emergency_stop')) else 'KAPALI'}</span>"
+
+st.markdown(f"""
+<div class="qp-topbar">
+  <div>
+    <div class="qp-brand">QuantPilot AI <span class="qp-pill paper">YALNIZCA PAPER TRADING</span></div>
+    <div class="qp-sub">Yerel AI Destekli NASDAQ Kantitatif Algoritmik İşlem Terminali • Gerçek Para Riski Yoktur</div>
+  </div>
+  <div class="qp-pills">{p_alp}{p_ol}{p_mkt}{p_wrk}{p_auto}</div>
+</div>
+""", unsafe_allow_html=True)
+
+if db.flag("emergency_stop"):
+    st.markdown("<div class='qp-banner stop'>🛑 ACİL DURDURMA AKTİF — Tüm yeni emirler engellendi ve açık emirler iptal edildi. 'Bot Kontrolleri' sekmesinden kaldırabilirsiniz.</div>", unsafe_allow_html=True)
+
+if demo_mode:
+    st.markdown(f"""<div class='qp-banner demo'>
+    ⚠️ <b>DEMO / ÖRNEK VERİ MODU</b> — <code>.env</code> dosyasında geçerli Alpaca Paper API anahtarı bulunamadı ({alpaca_msg}).
+    Aşağıda gördüğünüz portföy rakamları arayüz tanıtımı için üretilmiş <b>örnek verilerdir</b>; gerçek işlem veya kâr değildir.
+    Gerçek Paper hesabınızı bağlamak için <code>.env</code> dosyasına <code>ALPACA_API_KEY</code> ve <code>ALPACA_SECRET_KEY</code> ekleyin.
+    </div>""", unsafe_allow_html=True)
+
+if not (ol_health["online"] and ol_health["model_available"]):
+    st.markdown(f"<div class='qp-banner info'>ℹ️ <b>Yerel AI (Ollama) Çevrimdışı:</b> {ol_health['message']}. Deterministik strateji ve risk motoru AI olmadan güvenle çalışmaya devam eder.</div>", unsafe_allow_html=True)
+
+st.markdown("""<div class='qp-banner info'>
+📡 <b>Veri Akışı Notu (IEX Sınırlaması):</b> Ücretsiz Alpaca planı anlık veriyi yalnızca <b>IEX</b> borsasından sağlar
+(ABD hacminin ~%2–3'ü); bu nedenle anlık fiyat ve hacimler konsolide SIP akışından küçük farklar gösterebilir.
+Tarihsel günlük çubuklar (&gt;15 dk gecikmeli) SIP akışından, başarısız olursa IEX'ten çekilir.
+<b>Stop-loss uyarısı:</b> Stop emirleri tetiklendiğinde piyasa emrine dönüşür; fiyat boşluklarında (gap) stop fiyatından gerçekleşme <b>garanti edilmez</b>.
+</div>""", unsafe_allow_html=True)
+
+# ------------------------------------------------------------------ sidebar
+with st.sidebar:
+    st.markdown("### ⚡ Hızlı Kontroller")
+    c1, c2 = st.columns(2)
+    if c1.button("🔄 Senkronize Et", width="stretch", disabled=demo_mode):
+        st.toast(dispatch(db, broker, md, ollama, settings, "sync"))
+        st.rerun()
+    if c2.button("▶️ Şimdi Değerlendir", width="stretch", disabled=demo_mode):
+        st.toast(dispatch(db, broker, md, ollama, settings, "run_cycle"))
+        st.rerun()
+    if st.button("🛑 ACİL DURDUR", type="primary", width="stretch"):
+        st.toast(dispatch(db, broker, md, ollama, settings, "emergency_stop", {"close_positions": False}))
+        st.rerun()
+    st.caption(f"Başlangıç hedef bakiye: **${settings.initial_capital:,.0f}** (sanal USD)")
+    st.caption(f"Son senkronizasyon: `{db.get_state('last_sync') or '—'}`")
+    st.caption(f"Son strateji değerlendirmesi: `{db.get_state('last_evaluation') or '—'}`")
+    st.divider()
+    st.caption("💡 Arka plan işlemcisini (`start_bot.bat`) kapattığınızda veya Windows kapandığında otomatik işlem durur. Bu pencereyi kapatmak çalışan worker'ı durdurmaz.")
+
+# ------------------------------------------------------------------ data load
+acct = demo["account"] if demo_mode else (db.latest_account() or {"equity": 0, "cash": 0, "buying_power": 0, "last_equity": 0})
+positions = demo["positions"] if demo_mode else db.positions()
+orders = demo["orders"] if demo_mode else db.orders(limit=500)
+closed_trades, realized_by_order = fifo_realized(orders)
+realized_pl = sum(t.pnl for t in closed_trades)
+unrealized_pl = sum(float(p.get("unrealized_pl") or 0) for p in positions)
+equity = float(acct.get("equity") or 0)
+last_eq = float(acct.get("last_equity") or equity)
+today_pl = equity - last_eq
+today_pct = (today_pl / last_eq) if last_eq > 0 else 0.0
+tot_ret = equity - settings.initial_capital
+tot_pct = (tot_ret / settings.initial_capital) if settings.initial_capital > 0 else 0.0
+tag = "DEMO" if demo_mode else "GERÇEK PAPER"
+
+tabs = st.tabs([
+    "📊 A. Portföy & Pozisyonlar",
+    "📈 B. Performans Analitiği",
+    "🧾 D. Emir & İşlem Geçmişi",
+    "🤖 E. AI & Sinyal Analizi",
+    "🧪 Backtest & ML Eğitimi",
+    "🎛️ F. Bot Kontrolleri & İzleme Listesi",
+    "🖥️ G. Sistem Durumu & Kayıtlar",
+])
+
+# ======================================================= TAB 0: A + C
+with tabs[0]:
+    st.markdown("<div class='qp-section'>A. Portföy Genel Bakış</div>", unsafe_allow_html=True)
+    cards = [
+        card("Toplam Özsermaye (Equity)", usd(equity), f"Hedef başlangıç: {usd(settings.initial_capital)}", "neu", tag),
+        card("Kullanılabilir Nakit", usd(acct.get("cash")), f"Maruziyet: {pct((equity - float(acct.get('cash') or 0)) / max(equity, 1))}", "neu", tag),
+        card("Alım Gücü (Buying Power)", usd(acct.get("buying_power")), "Kaldıraç kullanılmaz (nakit sınırı)", "neu", tag),
+        card("Toplam Getiri ($ / %)", usd(tot_ret, True), pct(tot_pct, True), cls(tot_ret), tag),
+        card("Bugünkü K/Z (Günlük)", usd(today_pl, True), pct(today_pct, True), cls(today_pl), tag),
+        card("Gerçekleşmiş K/Z (FIFO)", usd(realized_pl, True), f"{len(closed_trades)} kapanmış paper işlem", cls(realized_pl), "YALNIZCA DOLU EMİRLER"),
+        card("Gerçekleşmemiş K/Z", usd(unrealized_pl, True), f"{len(positions)} açık pozisyon", cls(unrealized_pl), tag),
+    ]
+    st.markdown("<div class='qp-grid'>" + "".join(cards) + "</div>", unsafe_allow_html=True)
+
+    st.markdown("<div class='qp-section'>C. Açık Pozisyonlar</div>", unsafe_allow_html=True)
+    if not positions:
+        st.info("Açık pozisyon bulunmuyor.")
+    else:
+        rows = []
+        for p in positions:
+            mv = float(p.get("market_value") or 0)
+            rows.append({
+                "Hisse": p["symbol"],
+                "Adet": p["qty"],
+                "Ort. Giriş ($)": round(float(p["avg_entry_price"]), 2),
+                "Güncel Fiyat ($)": round(float(p["current_price"]), 2),
+                "Piyasa Değeri ($)": round(mv, 2),
+                "Gerçekleşmemiş K/Z ($)": round(float(p["unrealized_pl"]), 2),
+                "Gerçekleşmemiş K/Z (%)": round(float(p["unrealized_plpc"]) * 100, 2),
+                "Portföy Payı (%)": round(mv / max(equity, 1) * 100, 2),
+            })
+        st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
+
+# ======================================================= TAB 1: B
+with tabs[1]:
+    st.markdown("<div class='qp-section'>B. Performans Analitiği (Gerçek Paper Hesap — Backtest'ten Ayrı)</div>", unsafe_allow_html=True)
+    eq_s = pd.Series(dtype=float)
+    qqq_s = pd.Series(dtype=float)
+    if demo_mode:
+        eq_s, qqq_s = demo["equity_series"], demo["qqq_series"]
+    else:
+        if broker:
+            try:
+                ph = broker.get_portfolio_history(period="6M", timeframe="1D")
+                pts = [(datetime.fromtimestamp(t, tz=timezone.utc).date(), e)
+                       for t, e in zip(ph["timestamp"], ph["equity"]) if e and e > 0]
+                if pts:
+                    eq_s = pd.Series({ pd.Timestamp(d): float(v) for d, v in pts }).sort_index()
+            except Exception:
+                pass
+        if len(eq_s) < 2:
+            snaps = db.account_history()
+            if snaps:
+                df_s = pd.DataFrame(snaps)
+                df_s["d"] = pd.to_datetime(df_s["ts"]).dt.tz_convert("America/New_York").dt.normalize()
+                eq_s = df_s.groupby("d")["equity"].last()
+        if md and len(eq_s) >= 2:
+            try:
+                qb = md.daily_bars(["QQQ"], days=max(40, (eq_s.index[-1] - eq_s.index[0]).days + 10)).get("QQQ")
+                if qb is not None and not qb.empty:
+                    q = qb["close"].reindex(eq_s.index).ffill().dropna()
+                    if len(q):
+                        qqq_s = eq_s.iloc[0] * q / q.iloc[0]
+            except Exception:
+                pass
+
+    em = equity_metrics(eq_s)
+    ts = trade_stats(closed_trades)
+    pf_txt = "∞" if ts["profit_factor"] == float("inf") else (f"{ts['profit_factor']:.2f}" if ts["profit_factor"] is not None else "—")
+    sh_txt = f"{em['sharpe']:.2f}" if em["sharpe"] is not None else f"Anlamlı değil (n={em['n_obs']}<{MIN_OBS_FOR_SHARPE})"
+    m_cards = [
+        card("Kümülatif Getiri", pct(em["total_return"], True), f"{em['n_obs']} günlük gözlem", cls(em["total_return"]), tag),
+        card("Maksimum Düşüş (Max DD)", pct(em["max_drawdown"]), "Zirveden dibe", "neg" if em["max_drawdown"] else "neu", tag),
+        card("Kazanma Oranı (Win Rate)", pct(ts["win_rate"]), f"{ts['n_trades']} kapanmış işlem", "neu", "FIFO"),
+        card("Kâr Faktörü (Profit Factor)", pf_txt, f"Ort. işlem: {usd(ts['avg_trade'], True)}", cls(ts["total_pnl"]), "FIFO"),
+        card("Sharpe Oranı (Yıllık)", sh_txt, f"Yıllık vol: {pct(em['volatility'])}", "neu", "≥30 gün şartı"),
+    ]
+    st.markdown("<div class='qp-grid'>" + "".join(m_cards) + "</div>", unsafe_allow_html=True)
+
+    if len(eq_s) >= 2:
+        fig = dark_fig(360)
+        fig.add_trace(go.Scatter(x=eq_s.index, y=eq_s.values, name=f"Portföy ({tag})", line=dict(color="#38bdf8", width=2.4)))
+        if len(qqq_s) >= 2:
+            fig.add_trace(go.Scatter(x=qqq_s.index, y=qqq_s.values, name="QQQ Al-ve-Tut", line=dict(color="#a78bfa", width=1.8, dash="dot")))
+        fig.update_layout(title="Portföy Özsermaye Eğrisi vs QQQ Al-ve-Tut (USD)", yaxis_title="USD")
+        st.plotly_chart(fig, width="stretch")
+
+        c1, c2 = st.columns(2)
+        dd = drawdown_series(eq_s) * 100
+        f_dd = dark_fig(250)
+        f_dd.add_trace(go.Scatter(x=dd.index, y=dd.values, fill="tozeroy", name="Drawdown %", line=dict(color="#f87171")))
+        f_dd.update_layout(title="Düşüş (Drawdown %)")
+        c1.plotly_chart(f_dd, width="stretch")
+
+        rets = eq_s.pct_change().dropna() * 100
+        f_r = dark_fig(250)
+        colors = ["#34d399" if v >= 0 else "#f87171" for v in rets.values]
+        f_r.add_trace(go.Bar(x=rets.index, y=rets.values, marker_color=colors, name="Günlük %"))
+        f_r.update_layout(title="Günlük Getiriler (%)")
+        c2.plotly_chart(f_r, width="stretch")
+    else:
+        st.info("Özsermaye eğrisi için henüz yeterli geçmiş gün birikmedi. Bot çalıştıkça günlük anlık görüntüler kaydedilir.")
+
+# ======================================================= TAB 2: D
+with tabs[2]:
+    st.markdown("<div class='qp-section'>D. Emir ve İşlem Geçmişi (Dolu, Bekleyen ve Reddedilen Emirler Ayrı Gösterilir)</div>", unsafe_allow_html=True)
+    st.caption("Gerçekleşmiş K/Z yalnızca **gerçekten dolmuş (filled / partially_filled)** paper emirlerinden FIFO ile hesaplanır; dolmamış sinyaller veya bekleyen emirler kâra dahil edilmez.")
+    flt = st.radio("Filtre", ["Tümü", "Dolmuş (Filled)", "Açık / Bekleyen", "Reddedilen / İptal"], horizontal=True)
+    rows = []
+    for o in orders:
+        st_o = o.get("status") or ""
+        if flt == "Dolmuş (Filled)" and (o.get("filled_qty") or 0) <= 0:
+            continue
+        if flt == "Açık / Bekleyen" and st_o not in OPEN_STATUSES:
+            continue
+        if flt == "Reddedilen / İptal" and st_o not in ("rejected", "canceled", "expired"):
+            continue
+        r_pnl = realized_by_order.get(o["id"])
+        rows.append({
+            "Zaman": o.get("filled_at") or o.get("submitted_at"),
+            "Hisse": o.get("symbol"),
+            "Yön": (o.get("side") or "").upper(),
+            "Tür": o.get("order_type"),
+            "İstenen Adet": o.get("qty"),
+            "Dolan Adet": o.get("filled_qty"),
+            "İstenen/Ref Fiyat ($)": o.get("requested_price") or o.get("stop_price") or o.get("limit_price"),
+            "Gerçek Dolum Fiyatı ($)": o.get("filled_avg_price"),
+            "Durum": st_o,
+            "Gerçekleşmiş K/Z ($)": round(r_pnl, 2) if r_pnl is not None else None,
+            "Gerekçe": o.get("reason") or ("Harici / Manuel" if o.get("origin") != "quantpilot" else "—"),
+            "Client Order ID": o.get("client_order_id"),
+        })
+    if rows:
+        st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
+    else:
+        st.info("Seçilen filtreye uygun emir yok.")
+
+# ======================================================= TAB 3: E
+with tabs[3]:
+    st.markdown("<div class='qp-section'>E. Kantitatif Sinyaller, ML Olasılıkları ve Yerel Ollama AI Yorumları</div>", unsafe_allow_html=True)
+    st.caption("🔒 **Yetki Sınırı:** Ollama (Qwen3 8B) yalnızca mevcut sayısal sinyalleri Türkçe açıklar; hiçbir koşulda doğrudan emir oluşturamaz veya risk motorunu aşamaz.")
+    sigs = db.latest_signals_per_symbol()
+    if sigs:
+        srows = []
+        for s in sigs:
+            ind = json.loads(s.get("indicators") or "{}")
+            reasons = json.loads(s.get("reasons") or "[]")
+            rnotes = json.loads(s.get("risk_notes") or "[]")
+            srows.append({
+                "Hisse": s["symbol"], "Çubuk Tarihi": s.get("bar_date"), "Karar": s["action"],
+                "Fiyat ($)": round(float(s["price"]), 2) if s.get("price") else None,
+                "EMA Hızlı": round(ind["ema_fast"], 2) if ind.get("ema_fast") else None,
+                "EMA Yavaş": round(ind["ema_slow"], 2) if ind.get("ema_slow") else None,
+                "RSI": round(ind["rsi"], 1) if ind.get("rsi") else None,
+                "MACD Hist": round(ind["macd_hist"], 3) if ind.get("macd_hist") else None,
+                "ATR": round(ind["atr"], 2) if ind.get("atr") else None,
+                "ML Olasılığı": round(float(s["ml_prob"]), 3) if s.get("ml_prob") is not None else None,
+                "Model": s.get("model_version") or "—",
+                "Risk Onayı": ("Onay" if s["risk_approved"] else "Engellendi") if s["risk_approved"] is not None else "—",
+                "Gerekçe / Çelişkiler": " | ".join(reasons),
+                "Risk Notları": " | ".join(rnotes),
+            })
+        st.dataframe(pd.DataFrame(srows), width="stretch", hide_index=True)
+    else:
+        st.info("Henüz kaydedilmiş sinyal yok. Sol menüden '▶️ Şimdi Değerlendir' ile ilk taramayı çalıştırabilirsiniz.")
+
+    col_ai1, col_ai2 = st.columns([1, 2])
+    with col_ai1:
+        st.markdown("**Yerel Ollama Bağlantısı**")
+        st.write(f"URL: `{settings.ollama_url}` • Model: `{settings.ollama_model}`")
+        st.write(f"Durum: **{ol_health['message']}**")
+        if st.button("🧠 Portföy İçin Şimdi AI Özeti Üret", disabled=not (ol_health["online"] and ol_health["model_available"])):
+            with st.spinner("Qwen3 8B analiz ediyor..."):
+                summary = {"ozsermaye": equity, "nakit": acct.get("cash"), "bugun_kz": today_pl,
+                           "pozisyonlar": positions, "son_sinyaller": [
+                               {"hisse": s["symbol"], "karar": s["action"], "ml": s.get("ml_prob")} for s in sigs]}
+                ok, txt, lat = ollama.chat(portfolio_prompt(summary))
+                db.add_ai_analysis("portfolio", None, settings.ollama_model, ok, txt, lat)
+                st.rerun()
+    with col_ai2:
+        st.markdown("**Son AI Açıklamaları (Danışma Amaçlı)**")
+        ais = db.recent_ai(limit=8)
+        if not ais:
+            st.caption("Henüz AI analizi kaydedilmedi.")
+        for a in ais:
+            hdr = f"{a['ts']} • {a['scope'].upper()} {a.get('symbol') or ''} ({a['model']}, {a.get('latency_s', 0):.1f} sn)"
+            with st.expander(hdr, expanded=(a == ais[0])):
+                st.write(a["content"])
+
+# ======================================================= TAB 4: Backtest & ML
+with tabs[4]:
+    st.markdown("<div class='qp-section'>🧪 Tarihsel Backtest ve Walk-Forward ML Model Eğitimi (SİMÜLASYON)</div>", unsafe_allow_html=True)
+    st.caption("Backtest sonuçları **simülasyondur** ve gerçek Paper hesap metriklerinden tamamen ayrı tutulur. Emirler sinyal çubuğunun kapanışında değil, **ertesi günün açılışında** kayma (slippage) ve komisyon uygulanarak simüle edilir.")
+    params = db.get_params()
+    b1, b2, b3 = st.columns(3)
+    days_bt = b1.slider("Tarihsel Veri Penceresi (gün)", 400, 1825, 1100, 50)
+    use_ml_bt = b2.checkbox("Backtest'te Walk-Forward ML Olasılıklarını Kullan", value=bool(params["use_ml"]))
+    kind_ml = b3.selectbox("ML Model Türü", ["hgb", "logreg"], format_func=lambda x: "HistGradientBoosting (Kalibre)" if x == "hgb" else "Lojistik Regresyon (Baz)")
+
+    cb1, cb2 = st.columns(2)
+    if cb1.button("🚀 Backtest Çalıştır", type="primary", width="stretch"):
+        with st.spinner("Tarihsel veriler hazırlanıyor ve walk-forward backtest çalıştırılıyor..."):
+            syms = [w["symbol"] for w in db.watchlist(only_valid=True)] or [w["symbol"] for w in db.watchlist()]
+            if md:
+                bars_bt = md.daily_bars(list(set(syms + ["QQQ"])), days=days_bt)
+                feed_bt = f"alpaca:{md.last_feed_used}"
+            else:
+                bars_bt = demo_bars(list(set(syms + ["QQQ"])), n=min(days_bt, 650))
+                feed_bt = "DEMO_SENTETİK"
+            p_bt = dict(params, use_ml=use_ml_bt)
+            run_id, _ = run_and_store(bars_bt, p_bt, db, settings.model_dir, settings.initial_capital, feed_bt)
+            st.success(f"Backtest #{run_id} tamamlandı ({feed_bt}).")
+            st.rerun()
+
+    if cb2.button("🎓 ML Modelini Eğit ve Kaydet (Walk-Forward)", width="stretch"):
+        with st.spinner("Walk-forward doğrulama ve kalibrasyon ile model eğitiliyor..."):
+            syms = [w["symbol"] for w in db.watchlist(only_valid=True)] or [w["symbol"] for w in db.watchlist()]
+            bars_tr = md.daily_bars(syms, days=days_bt) if md else demo_bars(syms, n=min(days_bt, 650))
+            res_m = ModelTrainer(settings.model_dir, db).train_and_register(bars_tr, params, kind=kind_ml)
+            st.success(f"Model {res_m['version']} eğitildi ve aktif edildi.")
+            st.rerun()
+
+    runs = db.backtests(limit=10)
+    if runs:
+        sel = st.selectbox("Kayıtlı Backtest Koşuları", runs,
+                           format_func=lambda r: f"#{r['id']} • {r['ts']} ({json.loads(r['metrics']).get('data_feed', 'sim')})")
+        m = json.loads(sel["metrics"])
+        full = m.get("test") or m.get("full", {})
+        qqq_m = m.get("benchmark_qqq_test") or m.get("benchmark_qqq") or {}
+        st.caption(f"📌 **SİMÜLASYON** • {sel.get('notes') or ''} • Varsayımlar: `{json.dumps(m.get('assumptions', {}), ensure_ascii=False)}`")
+        bc = [
+            card("Backtest Getirisi", pct(full.get("total_return"), True), f"QQQ: {pct(qqq_m.get('total_return'), True)}", cls(full.get("total_return")), "SİMÜLASYON"),
+            card("CAGR (Yıllık Bileşik)", pct(full.get("cagr"), True), f"QQQ CAGR: {pct(qqq_m.get('cagr'), True)}", cls(full.get("cagr")), "SİMÜLASYON"),
+            card("Maksimum Düşüş", pct(full.get("max_drawdown")), f"QQQ DD: {pct(qqq_m.get('max_drawdown'))}", "neg", "SİMÜLASYON"),
+            card("Sharpe Oranı", f"{full['sharpe']:.2f}" if full.get("sharpe") is not None else "Anlamlı değil", f"İşlem sayısı: {full.get('n_trades', 0)}", "neu", "SİMÜLASYON"),
+            card("Kazanma Oranı / Kâr Faktörü", pct(full.get("win_rate")),
+                 f"PF: {full['profit_factor']:.2f}" if isinstance(full.get("profit_factor"), (int, float)) and full["profit_factor"] != float("inf") else "PF: —", "neu", "SİMÜLASYON"),
+        ]
+        st.markdown("<div class='qp-grid'>" + "".join(bc) + "</div>", unsafe_allow_html=True)
+
+        eq_pts = json.loads(sel["equity"])
+        bm_pts = json.loads(sel["benchmark"])
+        if eq_pts:
+            f_bt = dark_fig(340)
+            f_bt.add_trace(go.Scatter(x=[p[0] for p in eq_pts], y=[p[1] for p in eq_pts], name="Strateji (Simülasyon)", line=dict(color="#34d399", width=2.3)))
+            if bm_pts:
+                f_bt.add_trace(go.Scatter(x=[p[0] for p in bm_pts], y=[p[1] for p in bm_pts], name="QQQ Al-ve-Tut", line=dict(color="#a78bfa", width=1.8, dash="dot")))
+            f_bt.update_layout(title="Backtest Özsermaye Eğrisi vs QQQ (SİMÜLASYON — Gerçek Paper İşlemi Değildir)", yaxis_title="USD")
+            st.plotly_chart(f_bt, width="stretch")
+
+        bt_trades = json.loads(sel["trades"])
+        if bt_trades:
+            with st.expander(f"Simüle Edilen İşlemler ({len(bt_trades)} adet)"):
+                st.dataframe(pd.DataFrame(bt_trades), width="stretch", hide_index=True)
+
+    st.markdown("<div class='qp-section'>Aktif Makine Öğrenmesi Modeli (Gerçek Walk-Forward Metrikleri)</div>", unsafe_allow_html=True)
+    am = db.active_model()
+    if am:
+        mm = json.loads(am["metrics"])
+        oos = mm.get("oos_overall", {})
+        base_m = mm.get("baseline_logreg_oos") or {}
+        st.write(f"**Sürüm:** `{am['version']}` • **Eğitim aralığı:** `{am['train_start']} → {am['train_end']}` • **Veri özeti (hash):** `{am['data_hash']}` • **Oluşturulma:** `{am['created_at']}`")
+        mc = [
+            card("OOS ROC-AUC", f"{oos['roc_auc']:.3f}" if oos.get("roc_auc") else "—", f"Baz (LogReg): {base_m.get('roc_auc', 0):.3f}" if base_m.get("roc_auc") else "", "neu", "WALK-FORWARD"),
+            card("OOS Doğruluk (Accuracy)", pct(oos.get("accuracy")), f"Çoğunluk sınıfı bazı: {pct(oos.get('majority_baseline_acc'))}", "neu", "WALK-FORWARD"),
+            card("Brier Skoru (Kalibrasyon)", f"{oos['brier']:.4f}" if oos.get("brier") else "—", "Düşük = daha iyi", "neu", "WALK-FORWARD"),
+            card("Log Loss", f"{oos['log_loss']:.4f}" if oos.get("log_loss") else "—", f"Örneklem: {oos.get('n', 0)}", "neu", "WALK-FORWARD"),
+        ]
+        st.markdown("<div class='qp-grid'>" + "".join(mc) + "</div>", unsafe_allow_html=True)
+        c_f, c_cal = st.columns(2)
+        if mm.get("folds"):
+            c_f.caption("Walk-Forward Katman (Fold) Sonuçları")
+            c_f.dataframe(pd.DataFrame(mm["folds"]), width="stretch", hide_index=True)
+        if mm.get("calibration"):
+            c_cal.caption("Olasılık Kalibrasyon Tablosu (Tahmin vs Gerçekleşen Frekans)")
+            c_cal.dataframe(pd.DataFrame(mm["calibration"]), width="stretch", hide_index=True)
+    else:
+        st.warning("Henüz eğitilmiş aktif ML modeli yok. Yukarıdaki '🎓 ML Modelini Eğit ve Kaydet' düğmesini kullanın.")
+
+# ======================================================= TAB 5: F
+with tabs[5]:
+    st.markdown("<div class='qp-section'>F. Bot Kontrolleri, Güvenlik Kapısı, Risk Limitleri ve İzleme Listesi</div>", unsafe_allow_html=True)
+    params = db.get_params()
+    gate_ok, gate_msgs = (safety_gate(db, broker, params) if broker else (False, ["❌ Alpaca Paper API bağlantısı yok (.env)"]))
+    st.markdown("**Otomatik Paper Emir Ön Koşulları (Güvenlik Kapısı)**")
+    for gm in gate_msgs:
+        st.write(gm)
+
+    k1, k2, k3, k4 = st.columns(4)
+    if k1.button("▶️ Botu Başlat", width="stretch"):
+        st.toast(dispatch(db, broker, md, ollama, settings, "start"))
+        st.rerun()
+    if k2.button("⏸️ Botu Duraklat", width="stretch"):
+        st.toast(dispatch(db, broker, md, ollama, settings, "pause"))
+        st.rerun()
+    if k3.button("🛑 Acil Durdur (Emirleri İptal Et)", type="primary", width="stretch"):
+        st.toast(dispatch(db, broker, md, ollama, settings, "emergency_stop", {"close_positions": False}))
+        st.rerun()
+    if db.flag("emergency_stop") and k4.button("🔓 Acil Durdurmayı Kaldır", width="stretch"):
+        st.toast(dispatch(db, broker, md, ollama, settings, "clear_emergency"))
+        st.rerun()
+
+    with st.expander("⚠️ Tüm Açık Pozisyonları Piyasa Emriyle Kapat (Onay Gerektirir)"):
+        confirm_liq = st.checkbox("Tüm açık paper pozisyonlarının piyasa emriyle kapatılmasını onaylıyorum.")
+        if st.button("💥 Tüm Pozisyonları Kapat ve Durdur", disabled=not (confirm_liq and broker)):
+            st.toast(dispatch(db, broker, md, ollama, settings, "emergency_stop", {"close_positions": True}))
+            st.rerun()
+
+    auto_now = db.flag("auto_trading")
+    new_auto = st.toggle("Otomatik Paper Emirlerini Etkinleştir (YALNIZCA PAPER)", value=auto_now,
+                         disabled=not gate_ok or db.flag("emergency_stop"))
+    if new_auto != auto_now:
+        db.set_state("auto_trading", new_auto)
+        st.rerun()
+
+    st.divider()
+    st.markdown("**Strateji ve Risk Parametreleri** *(Üst tavanlar kilitlidir: hisse başı ≤%10, toplam maruziyet ≤%50, işlem başı risk ≤%1, günlük düşüş ≤%3)*")
+    with st.form("params_form"):
+        f1, f2, f3 = st.columns(3)
+        ema_fast = f1.number_input("Hızlı EMA", 5, 100, int(params["ema_fast"]))
+        ema_slow = f1.number_input("Yavaş EMA", 20, 250, int(params["ema_slow"]))
+        rsi_min = f1.number_input("RSI Giriş Alt Sınır", 20.0, 70.0, float(params["rsi_entry_min"]), 1.0)
+        rsi_max = f1.number_input("RSI Giriş Üst Sınır", 40.0, 85.0, float(params["rsi_entry_max"]), 1.0)
+        use_ml = f2.checkbox("ML Olasılık Filtresini Kullan", value=bool(params["use_ml"]))
+        ml_thr = f2.slider("Minimum ML Olasılığı", 0.50, 0.80, float(params["ml_prob_threshold"]), 0.01)
+        atr_mult = f2.number_input("ATR Stop Çarpanı", 1.0, 5.0, float(params["atr_stop_mult"]), 0.25)
+        place_stops = f2.checkbox("Dolum Sonrası Koruyucu Stop Emri Gönder", value=bool(params["place_stop_orders"]))
+        max_pos = f3.slider("Hisse Başına Maks. Özsermaye (%)", 1, int(HARD_LIMITS["max_position_pct"] * 100), int(params["max_position_pct"] * 100)) / 100
+        max_exp = f3.slider("Toplam Portföy Maruziyeti (%)", 5, int(HARD_LIMITS["max_exposure_pct"] * 100), int(params["max_exposure_pct"] * 100)) / 100
+        max_rsk = f3.slider("İşlem Başına Maks. Planlanan Risk (%)", 0.2, HARD_LIMITS["max_risk_per_trade_pct"] * 100, float(params["max_risk_per_trade_pct"] * 100), 0.1) / 100
+        max_dd = f3.slider("Günlük Düşüş Durdurma Limiti (%)", 0.5, HARD_LIMITS["max_daily_drawdown_pct"] * 100, float(params["max_daily_drawdown_pct"] * 100), 0.5) / 100
+        cooldown = f3.number_input("İşlemler Arası Bekleme Süresi (dakika)", 0, 10080, int(params["cooldown_minutes"]), 60)
+        if st.form_submit_button("💾 Parametreleri Kaydet"):
+            db.set_params({"ema_fast": ema_fast, "ema_slow": ema_slow, "rsi_entry_min": rsi_min, "rsi_entry_max": rsi_max,
+                           "use_ml": use_ml, "ml_prob_threshold": ml_thr, "atr_stop_mult": atr_mult,
+                           "place_stop_orders": place_stops, "max_position_pct": max_pos, "max_exposure_pct": max_exp,
+                           "max_risk_per_trade_pct": max_rsk, "max_daily_drawdown_pct": max_dd, "cooldown_minutes": cooldown})
+            st.success("Parametreler kaydedildi.")
+            st.rerun()
+
+    st.divider()
+    st.markdown("**İzleme Listesi (NASDAQ Doğrulamalı)**")
+    w1, w2, w3 = st.columns([2, 1, 1])
+    new_sym = w1.text_input("Sembol Ekle (örn. INTC, AVGO, QCOM)", placeholder="SEMBOL").upper().strip()
+    if w2.button("➕ Ekle") and new_sym:
+        db.add_symbol(new_sym)
+        if broker:
+            validate_watchlist(broker, db)
+        st.rerun()
+    if w3.button("🔍 Tümünü Doğrula", disabled=not broker):
+        st.toast(dispatch(db, broker, md, ollama, settings, "validate_watchlist"))
+        st.rerun()
+
+    wl = db.watchlist()
+    for row in wl:
+        c_a, c_b, c_c, c_d = st.columns([1.2, 1.2, 5, 1])
+        c_a.markdown(f"**{row['symbol']}**")
+        c_b.markdown("✅ Geçerli" if row["is_valid"] else "⚠️ Doğrulanmadı")
+        c_c.caption(row.get("note") or "Henüz Alpaca varlık üstverisi ile doğrulanmadı")
+        if c_d.button("Sil", key=f"del_{row['symbol']}"):
+            db.remove_symbol(row["symbol"])
+            st.rerun()
+
+# ======================================================= TAB 6: G
+with tabs[6]:
+    st.markdown("<div class='qp-section'>G. Sistem Durumu, Öz-Test ve Hata Kayıtları</div>", unsafe_allow_html=True)
+    st_ok, st_msgs = run_self_test(db.get_params())
+    s1, s2 = st.columns(2)
+    with s1:
+        st.markdown("**Bağlantı ve Zamanlayıcı Durumu**")
+        st.write({
+            "Alpaca Bağlantısı": alpaca_msg,
+            "Uç Nokta (PAPER)": settings.base_url,
+            "Ollama Bağlantısı": ol_health["message"],
+            "Piyasa Durumu": market_status_text(session) if session else "Bilinmiyor",
+            "Son Veri Güncellemesi": db.get_state("last_data_update") or "—",
+            "Son Strateji Değerlendirmesi": db.get_state("last_evaluation") or "—",
+            "Son Başarılı Senkronizasyon": db.get_state("last_sync") or "—",
+            "Aktif Veri Akışı": db.get_state("active_feed") or f"tarihsel={settings.historical_feed}, anlık={settings.data_feed}",
+            "Arka Plan Worker": w_text,
+        })
+    with s2:
+        st.markdown("**Risk Motoru Otomatik Öz-Testi**")
+        for m in st_msgs:
+            st.write(m)
+
+    st.markdown("**Yapılandırılmış Uyarı ve Hata Kayıtları (SQLite + logs/worker.log)**")
+    evs = db.recent_events(limit=100)
+    if evs:
+        st.dataframe(pd.DataFrame(evs), width="stretch", hide_index=True)
+    else:
+        st.caption("Kayıtlı uyarı veya hata bulunmuyor.")
