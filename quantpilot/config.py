@@ -97,6 +97,8 @@ def load_settings(env_file: Path | None = None, require_credentials: bool = Fals
     env_path = env_file or (PROJECT_ROOT / ".env")
     if env_path.exists():
         load_dotenv(env_path, override=False)
+    elif env_file is None and (PROJECT_ROOT / ".cloud_env").exists():
+        load_dotenv(PROJECT_ROOT / ".cloud_env", override=False)
 
     def g(name: str, default: str = "") -> str:
         val = os.environ.get(name, "")
