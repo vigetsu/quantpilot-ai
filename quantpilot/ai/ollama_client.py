@@ -1,10 +1,10 @@
-"""Local Ollama (Qwen3 8B) client with a built-in deterministic Turkish Quantitative AI analyst fallback.
+"""Local Ollama (Qwen3 8B) client with a deterministic Turkish TEMPLATE fallback.
 
 - Advisory ONLY: receives already-computed numbers and returns explanatory Turkish text.
-- When local Ollama (`localhost:11434`) is reachable and has `qwen3:8b`, it uses Ollama.
+- When local Ollama (`localhost:11434`) is reachable and has `qwen3:8b`, it uses Ollama (real LLM).
 - In cloud environments (e.g. Streamlit Community Cloud) or when Ollama is not running locally,
-  it automatically uses the built-in deterministic Turkish quantitative synthesis engine so
-  signal/portfolio explanations, risk warnings, and conflict analyses are always available 24/7.
+  it falls back to a deterministic text TEMPLATE filled with the same numbers. This is NOT an AI
+  model, and it is labeled as such (``source_label() == BUILTIN_LABEL``) in the DB and dashboard.
 - Output is stored strictly as text and can never create or alter an order decision.
 """
 from __future__ import annotations
@@ -18,6 +18,11 @@ import requests
 
 log = logging.getLogger("quantpilot.ai")
 _THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
+BUILTIN_LABEL = "şablon-özet (AI değil)"
+
+
+def _num(x) -> bool:
+    return isinstance(x, (int, float)) and not isinstance(x, bool) and x == x  # excludes NaN
 
 SYSTEM_PROMPT = (
     "Sen deneyimli bir kantitatif analistsin. Sana verilen yapılandırılmış sayısal sinyalleri Türkçe, kısa ve "
@@ -50,23 +55,22 @@ def _builtin_analysis(user_prompt: str) -> str:
         hv = ind.get("hv20")
         mh = ind.get("macd_hist")
 
-        trend_txt = (
-            f"EMA20 ({ef:.2f}) > EMA50 ({es:.2f}) ile orta vadeli yükseliş eğiliminde"
-            if (isinstance(ef, (int, float)) and isinstance(es, (int, float)) and ef > es)
-            else f"EMA20 ({ef}) <= EMA50 ({es}) ile baskı/düşüş eğiliminde"
-        )
-        rsi_txt = f"RSI {rsi:.1f}" if isinstance(rsi, (int, float)) else "RSI hesaplanmadı"
-        prob_txt = f"%{prob * 100:.1f}" if isinstance(prob, (int, float)) else "mevcut değil"
-        atr_txt = (
-            f"ATR ${atr:.2f} (günlük oynaklık ~%{(atr / close * 100):.1f})"
-            if (isinstance(atr, (int, float)) and isinstance(close, (int, float)) and close > 0)
-            else f"ATR {atr}"
-        )
-        hv_txt = f", yıllıklandırılmış 20g tarihsel volatilite %{hv * 100:.1f}" if isinstance(hv, (int, float)) else ""
+        if _num(ef) and _num(es):
+            trend_txt = (f"hızlı EMA ({ef:.2f}) > yavaş EMA ({es:.2f}) ile yükseliş eğiliminde" if ef > es
+                         else f"hızlı EMA ({ef:.2f}) <= yavaş EMA ({es:.2f}) ile baskı/düşüş eğiliminde")
+        else:
+            trend_txt = "trend göstergeleri hesaplanamadı"
+        rsi_txt = f"RSI {rsi:.1f}" if _num(rsi) else "RSI hesaplanmadı"
+        prob_txt = f"%{prob * 100:.1f}" if _num(prob) else "mevcut değil"
+        atr_txt = (f"ATR ${atr:.2f} (günlük oynaklık ~%{(atr / close * 100):.1f})"
+                   if (_num(atr) and _num(close) and close > 0) else "ATR hesaplanamadı")
+        hv_txt = f", yıllıklandırılmış 20g tarihsel volatilite %{hv * 100:.1f}" if _num(hv) else ""
+        close_txt = f"${close:.2f}" if _num(close) else "bilinmeyen fiyat"
+        mh_txt = f"{mh:.4f}" if _num(mh) else "—"
 
         return (
-            f"1) Piyasa yorumu: {sym} son kapanışta ${close:.2f} seviyesinde; {trend_txt}. "
-            f"{rsi_txt}, MACD histogramı {mh if mh is not None else '—'} ve 5 günlük pozitif getiri ML olasılığı {prob_txt}.\n"
+            f"1) Piyasa yorumu: {sym} son kapanışta {close_txt} seviyesinde; {trend_txt}. "
+            f"{rsi_txt}, MACD histogramı {mh_txt} ve ileri getiri ML olasılığı {prob_txt}.\n"
             f"2) Kararın gerekçesi ({act}): {'; '.join(reasons) if reasons else 'Standart kurallar değerlendirildi.'}\n"
             f"3) Riskler: {atr_txt}{hv_txt}. Stop-loss emirleri fiyat boşluklarında (gap) stop fiyatından dolmayabilir. "
             f"{('Risk motoru: ' + '; '.join(rnotes)) if rnotes else ''}\n"
@@ -89,11 +93,11 @@ def _builtin_analysis(user_prompt: str) -> str:
             f"Son taramada AL (BUY) sinyali: {', '.join(buys) if buys else 'yok'}; "
             f"SAT (SELL) sinyali: {', '.join(sells) if sells else 'yok'}; "
             f"BEKLE (HOLD): {', '.join(holds) if holds else 'yok'}. "
-            f"Risk Uyarıları: Hisse başı maks. %10 özsermaye, toplam maks. %50 maruziyet, işlem başı maks. %1 planlanan risk "
-            f"ve %3 günlük düşüş durdurma kuralları aktiftir; tüm emirler yalnızca PAPER hesabına iletilir."
+            f"Risk Uyarıları: Hisse başı ≤%10 özsermaye, toplam ≤%50 maruziyet, işlem başı ≤%1 planlanan risk "
+            f"ve ≤%3 günlük düşüş tavanları aktiftir; tüm emirler yalnızca PAPER hesabına iletilir."
         )
 
-    return "Yapılandırılmış kantitatif analiz tamamlandı."
+    return "Yapılandırılmış şablon özet üretildi."
 
 
 class OllamaClient:
@@ -104,9 +108,21 @@ class OllamaClient:
         self.timeout = timeout
         self.http = session
         self.allow_builtin_fallback = allow_builtin_fallback
+        self.last_source = model  # who produced the last chat() text: the model name or BUILTIN_LABEL
+
+    def source_label(self) -> str:
+        return self.last_source
 
     def _session(self) -> requests.Session:
         return self.http or requests.Session()
+
+    def _builtin(self, user_prompt: str, t0: float) -> tuple[bool, str, float]:
+        self.last_source = BUILTIN_LABEL
+        try:
+            return True, _builtin_analysis(user_prompt), time.monotonic() - t0
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Şablon özet üretilemedi: %s", exc)
+            return False, f"Şablon özet üretilemedi: {type(exc).__name__}", time.monotonic() - t0
 
     def health(self) -> dict:
         try:
@@ -120,13 +136,13 @@ class OllamaClient:
                         "message": f"Aktif (Ollama {self.model})"}
             if self.allow_builtin_fallback and self.http is None:
                 return {"online": True, "model_available": True, "mode": "builtin", "models": names,
-                        "message": f"Aktif (Yerleşik Kantitatif AI • {self.model} indirilebilir)"}
+                        "message": f"Şablon özet modu (AI değil) • '{self.model}' yok: ollama pull {self.model}"}
             return {"online": True, "model_available": False, "mode": "ollama", "models": names,
                     "message": f"Ollama çalışıyor ancak '{self.model}' modeli yok. Çalıştırın: ollama pull {self.model}"}
         except Exception as exc:  # noqa: BLE001
             if self.allow_builtin_fallback and self.http is None:
                 return {"online": True, "model_available": True, "mode": "builtin", "models": [],
-                        "message": "Aktif (Yerleşik Kantitatif AI Motoru)"}
+                        "message": f"Şablon özet modu (AI değil) • Ollama'ya ulaşılamadı ({type(exc).__name__})"}
             return {"online": False, "model_available": False, "mode": "offline", "models": [],
                     "message": f"Ollama'ya ulaşılamadı ({self.base_url}): {type(exc).__name__}"}
 
@@ -142,13 +158,16 @@ class OllamaClient:
             text = r.json().get("message", {}).get("content", "")
             text = _THINK_RE.sub("", text).strip()
             if text:
+                self.last_source = self.model
                 return True, text, time.monotonic() - t0
             if self.allow_builtin_fallback and self.http is None:
-                return True, _builtin_analysis(user_prompt), time.monotonic() - t0
+                return self._builtin(user_prompt, t0)
+            self.last_source = self.model
             return False, "Model boş yanıt döndürdü.", time.monotonic() - t0
         except Exception as exc:  # noqa: BLE001
             if self.allow_builtin_fallback and self.http is None:
-                return True, _builtin_analysis(user_prompt), time.monotonic() - t0
+                return self._builtin(user_prompt, t0)
+            self.last_source = self.model
             log.warning("Ollama isteği başarısız: %s", exc)
             return False, f"AI çevrimdışı: {type(exc).__name__}", time.monotonic() - t0
 

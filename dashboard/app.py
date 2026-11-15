@@ -7,6 +7,7 @@ labeled DEMO data so you can explore the interface before connecting your paper 
 """
 from __future__ import annotations
 
+import hmac
 import json
 import sys
 from datetime import datetime, timezone
@@ -21,13 +22,8 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 from dashboard.mock_data import demo_bars, demo_bundle  # noqa: E402
-import importlib
-import quantpilot.ai.ollama_client as _oc_mod
-import quantpilot.engine as _eng_mod
-import quantpilot.embedded_worker as _ew_mod
-importlib.reload(_oc_mod)
-importlib.reload(_eng_mod)
-importlib.reload(_ew_mod)
+# NOTE: never importlib.reload() quantpilot modules here. Streamlit re-runs this script on every
+# click; reloading embedded_worker reset its lock state and started an extra scheduler each time.
 from quantpilot.ai.ollama_client import OllamaClient, portfolio_prompt, signal_prompt  # noqa: E402
 from quantpilot.analytics.performance import (  # noqa: E402
     MIN_OBS_FOR_SHARPE,
@@ -93,6 +89,23 @@ def dark_fig(height: int = 340) -> go.Figure:
     return fig
 
 
+# Streamlit re-runs the WHOLE script (all tabs) on every click. Cache slow Alpaca calls so a
+# click does not trigger several broker/data API requests each time.
+@st.cache_data(ttl=300, show_spinner=False)
+def cached_portfolio_history(_broker, period: str = "6M") -> dict:
+    return _broker.get_portfolio_history(period=period, timeframe="1D")
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def cached_daily_bars(_md, symbols: tuple[str, ...], days: int) -> dict:
+    return _md.daily_bars(list(symbols), days=days)
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def cached_safety_gate(_db, _broker, params_json: str) -> tuple[bool, list[str]]:
+    return safety_gate(_db, _broker, json.loads(params_json))
+
+
 def worker_alive(db: Database) -> tuple[bool, str]:
     hb = db.get_state("worker_heartbeat")
     if not hb:
@@ -106,7 +119,16 @@ def worker_alive(db: Database) -> tuple[bool, str]:
 
 def dispatch(db: Database, broker: AlpacaBroker | None, md: MarketData | None, ollama: OllamaClient,
              settings, cmd: str, payload: dict | None = None) -> str:
-    """If the background worker is running, queue the command; otherwise execute immediately in-process."""
+    """If the background worker is running, queue the command; otherwise execute immediately in-process.
+
+    EMERGENCY STOP is always executed immediately (never only queued): it must not depend on a
+    worker that may be stuck, asleep or missing its command loop.
+    """
+    if cmd == "emergency_stop" and broker:
+        msg = TradingEngine(settings, db, broker, md, ollama).exec.emergency_stop(
+            close_positions=bool((payload or {}).get("close_positions")))
+        db.enqueue_command("refresh_gate")
+        return msg
     alive, _ = worker_alive(db)
     if alive:
         db.enqueue_command(cmd, payload)
@@ -156,7 +178,7 @@ if _dash_pw and not st.session_state.get("pw_ok"):
     st.markdown("<div class='qp-topbar'><div class='qp-brand'>🔒 QuantPilot AI — Giriş Koruması</div></div>", unsafe_allow_html=True)
     _entered = st.text_input("Panel Şifresi", type="password")
     if st.button("Giriş Yap", type="primary"):
-        if _entered == _dash_pw:
+        if hmac.compare_digest(_entered.encode("utf-8"), _dash_pw.encode("utf-8")):
             st.session_state["pw_ok"] = True
             st.rerun()
         else:
@@ -193,8 +215,14 @@ ol_health = ollama.health()
 
 # ------------------------------------------------------------------ top bar
 p_alp = f"<span class='qp-pill {'ok' if alpaca_ok else 'warn'}'>Alpaca: {'PAPER Bağlı' if alpaca_ok else 'DEMO Modu'}</span>"
-_ai_label = f"Ollama ({settings.ollama_model}): Aktif" if ol_health.get("mode") == "ollama" else ("AI Analiz: Aktif" if (ol_health["online"] and ol_health["model_available"]) else f"Ollama ({settings.ollama_model}): Çevrimdışı")
-p_ol = f"<span class='qp-pill {'ok' if (ol_health['online'] and ol_health['model_available']) else 'warn'}'>{_ai_label}</span>"
+_ai_mode = ol_health.get("mode")
+if _ai_mode == "ollama" and ol_health["model_available"]:
+    _ai_label, _ai_cls = f"Ollama ({settings.ollama_model}): Aktif", "ok"
+elif _ai_mode == "builtin":
+    _ai_label, _ai_cls = "Açıklamalar: Şablon Mod (AI değil)", "warn"
+else:
+    _ai_label, _ai_cls = f"Ollama ({settings.ollama_model}): Çevrimdışı", "warn"
+p_ol = f"<span class='qp-pill {_ai_cls}'>{_ai_label}</span>"
 p_mkt = f"<span class='qp-pill {'ok' if (session and session.is_open) else 'neu'}'>ABD Piyasası: {market_status_text(session) if session else 'DEMO'}</span>"
 p_wrk = f"<span class='qp-pill {'ok' if w_alive else 'warn'}'>Worker: {w_text}</span>"
 p_auto = f"<span class='qp-pill {'ok' if (db.flag('auto_trading') and not db.flag('emergency_stop')) else 'bad'}'>Oto. Paper Emir: {'AÇIK' if (db.flag('auto_trading') and not db.flag('emergency_stop')) else 'KAPALI'}</span>"
@@ -219,8 +247,28 @@ if demo_mode:
     Gerçek Paper hesabınızı bağlamak için <code>.env</code> dosyasına <code>ALPACA_API_KEY</code> ve <code>ALPACA_SECRET_KEY</code> ekleyin.
     </div>""", unsafe_allow_html=True)
 
-if not (ol_health["online"] and ol_health["model_available"]):
+if alpaca_ok and not _dash_pw:
+    st.markdown("<div class='qp-banner stop'>🔓 <b>Panel şifresiz:</b> Bu sayfanın adresini bilen herkes botu başlatıp durdurabilir, "
+                "parametreleri değiştirebilir ve pozisyonları kapatabilir. Streamlit Cloud → App settings → Secrets bölümüne "
+                "<code>DASHBOARD_PASSWORD = \"güçlü-bir-şifre\"</code> ekleyin.</div>", unsafe_allow_html=True)
+
+if _ai_mode == "builtin":
+    st.markdown(f"<div class='qp-banner info'>ℹ️ <b>Şablon açıklama modu:</b> {ol_health['message']}. Sinyal açıklamaları bir yapay zekâ "
+                "tarafından değil, aynı sayılarla doldurulan sabit bir metin şablonuyla üretiliyor. Strateji ve risk motoru bundan etkilenmez.</div>",
+                unsafe_allow_html=True)
+elif not (ol_health["online"] and ol_health["model_available"]):
     st.markdown(f"<div class='qp-banner info'>ℹ️ <b>Yerel AI (Ollama) Çevrimdışı:</b> {ol_health['message']}. Deterministik strateji ve risk motoru AI olmadan güvenle çalışmaya devam eder.</div>", unsafe_allow_html=True)
+
+_am_banner = db.active_model()
+if _am_banner and db.get_params().get("use_ml", True):
+    try:
+        _auc = (json.loads(_am_banner["metrics"]).get("oos_overall") or {}).get("roc_auc")
+    except Exception:
+        _auc = None
+    if _auc is not None and _auc < 0.52:
+        st.markdown(f"<div class='qp-banner stop'>📉 <b>ML modeli tahmin gücü göstermiyor:</b> örneklem dışı ROC-AUC = {_auc:.3f} "
+                    "(0,50 = yazı-tura). ML olasılık filtresi şu an alım kararlarına anlamlı bir bilgi katmıyor. "
+                    "'Backtest & ML' sekmesinde ML'li ve ML'siz backtest sonuçlarını karşılaştırın.</div>", unsafe_allow_html=True)
 
 st.markdown("""<div class='qp-banner info'>
 📡 <b>Veri Akışı Notu (IEX Sınırlaması):</b> Ücretsiz Alpaca planı anlık veriyi yalnızca <b>IEX</b> borsasından sağlar
@@ -316,7 +364,7 @@ with tabs[1]:
     else:
         if broker:
             try:
-                ph = broker.get_portfolio_history(period="6M", timeframe="1D")
+                ph = cached_portfolio_history(broker, "6M")
                 pts = [(datetime.fromtimestamp(t, tz=timezone.utc).date(), e)
                        for t, e in zip(ph["timestamp"], ph["equity"]) if e and e > 0]
                 if pts:
@@ -331,7 +379,7 @@ with tabs[1]:
                 eq_s = df_s.groupby("d")["equity"].last()
         if md and len(eq_s) >= 2:
             try:
-                qb = md.daily_bars(["QQQ"], days=max(40, (eq_s.index[-1] - eq_s.index[0]).days + 10)).get("QQQ")
+                qb = cached_daily_bars(md, ("QQQ",), max(40, (eq_s.index[-1] - eq_s.index[0]).days + 10)).get("QQQ")
                 if qb is not None and not qb.empty:
                     q = qb["close"].reindex(eq_s.index).ffill().dropna()
                     if len(q):
@@ -444,31 +492,33 @@ with tabs[3]:
         st.markdown("**Yerel Ollama Bağlantısı**")
         st.write(f"URL: `{settings.ollama_url}` • Model: `{settings.ollama_model}`")
         st.write(f"Durum: **{ol_health['message']}**")
-        if st.button("🧠 Portföy İçin Şimdi AI Özeti Üret", disabled=not (ol_health["online"] and ol_health["model_available"])):
-            with st.spinner("Qwen3 8B analiz ediyor..."):
+        if st.button("🧠 Portföy İçin Şimdi Özet Üret", disabled=not (ol_health["online"] and ol_health["model_available"])):
+            with st.spinner("Qwen3 8B analiz ediyor..." if _ai_mode == "ollama" else "Şablon özet hazırlanıyor..."):
                 summary = {"ozsermaye": equity, "nakit": acct.get("cash"), "bugun_kz": today_pl,
                            "pozisyonlar": positions, "son_sinyaller": [
                                {"hisse": s["symbol"], "karar": s["action"], "ml": s.get("ml_prob")} for s in sigs]}
                 ok, txt, lat = ollama.chat(portfolio_prompt(summary))
-                db.add_ai_analysis("portfolio", None, settings.ollama_model, ok, txt, lat)
+                db.add_ai_analysis("portfolio", None, ollama.source_label(), ok, txt, lat)
                 st.rerun()
     with col_ai2:
-        st.markdown("**Son AI Açıklamaları (Danışma Amaçlı)**")
-        db.execute("DELETE FROM ai_analyses WHERE ok=0 OR content LIKE 'AI çevrimdışı%'")
-        ais = db.recent_ai(limit=8)
-        if not ais and sigs:
+        st.markdown("**Son Açıklamalar (Danışma Amaçlı)**")
+        # Show only successful outputs; failed rows stay in the DB for diagnostics (never deleted on view).
+        ais = db.query("SELECT * FROM ai_analyses WHERE ok=1 ORDER BY id DESC LIMIT 8")
+        if not ais and sigs and _ai_mode == "builtin":
+            # Template mode is instant, so it is safe to fill in explanations during page render.
+            # (A real Ollama call can take up to OLLAMA_TIMEOUT seconds per signal: never do that here.)
             for _s in sigs:
                 _ind = json.loads(_s.get("indicators") or "{}")
                 _rsn = json.loads(_s.get("reasons") or "[]")
                 _rn = json.loads(_s.get("risk_notes") or "[]")
                 _ok, _txt, _lat = ollama.chat(signal_prompt(_s["symbol"], _s["action"], _ind, _s.get("ml_prob"), _rsn, [], _rn))
-                db.add_ai_analysis("signal", _s["symbol"], settings.ollama_model, _ok, _txt, _lat)
+                db.add_ai_analysis("signal", _s["symbol"], ollama.source_label(), _ok, _txt, _lat)
             _summary = {"ozsermaye": equity, "nakit": acct.get("cash"), "bugun_kz": today_pl,
                         "pozisyonlar": positions, "son_sinyaller": [
                             {"hisse": s["symbol"], "karar": s["action"], "ml": s.get("ml_prob")} for s in sigs]}
             _ok, _ptxt, _lat = ollama.chat(portfolio_prompt(_summary))
-            db.add_ai_analysis("portfolio", None, settings.ollama_model, _ok, _ptxt, _lat)
-            ais = db.recent_ai(limit=8)
+            db.add_ai_analysis("portfolio", None, ollama.source_label(), _ok, _ptxt, _lat)
+            ais = db.query("SELECT * FROM ai_analyses WHERE ok=1 ORDER BY id DESC LIMIT 8")
         if not ais:
             st.caption("Henüz AI analizi kaydedilmedi.")
         for a in ais:
@@ -570,7 +620,8 @@ with tabs[4]:
 with tabs[5]:
     st.markdown("<div class='qp-section'>F. Bot Kontrolleri, Güvenlik Kapısı, Risk Limitleri ve İzleme Listesi</div>", unsafe_allow_html=True)
     params = db.get_params()
-    gate_ok, gate_msgs = (safety_gate(db, broker, params) if broker else (False, ["❌ Alpaca Paper API bağlantısı yok (.env)"]))
+    gate_ok, gate_msgs = (cached_safety_gate(db, broker, json.dumps(params, sort_keys=True, default=str)) if broker
+                          else (False, ["❌ Alpaca Paper API bağlantısı yok (.env)"]))
     st.markdown("**Otomatik Paper Emir Ön Koşulları (Güvenlik Kapısı)**")
     for gm in gate_msgs:
         st.write(gm)

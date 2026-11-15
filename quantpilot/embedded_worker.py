@@ -10,6 +10,7 @@ from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 
 from quantpilot.backtest.runner import run_and_store
+from quantpilot.commands import process_commands
 from quantpilot.data.universe import validate_watchlist
 from quantpilot.db import utcnow
 from quantpilot.engine import TradingEngine
@@ -17,14 +18,18 @@ from quantpilot.ml.model import ModelTrainer, load_active_predictor
 from quantpilot.worker import NY_TZ, SingleInstanceLock
 
 log = logging.getLogger("quantpilot.embedded")
-_LOCK = threading.Lock()
-_STARTED = False
-_FILE_LOCK: SingleInstanceLock | None = None
+# Reload-safe module state: if this module is ever re-imported/reloaded, keep the existing
+# lock objects. Resetting _FILE_LOCK to None would garbage-collect the open lock file,
+# release the OS lock and let a SECOND scheduler start in the same process.
+_LOCK = globals().get("_LOCK") or threading.Lock()
+_STARTED = globals().get("_STARTED", False)
+_FILE_LOCK: SingleInstanceLock | None = globals().get("_FILE_LOCK")
+_SCHEDULER = globals().get("_SCHEDULER")
 
 
 def ensure_embedded_worker(settings, db, broker, md, ollama) -> bool:
     """Start an in-process BackgroundScheduler if no external worker process is already holding worker.lock."""
-    global _STARTED, _FILE_LOCK
+    global _STARTED, _FILE_LOCK, _SCHEDULER
     if not settings.has_credentials or broker is None or md is None:
         return False
     with _LOCK:
@@ -58,6 +63,34 @@ def ensure_embedded_worker(settings, db, broker, md, ollama) -> bool:
             log.exception("Bulut strateji döngüsü hatası: %s", exc)
         finally:
             cycle_lock.release()
+
+    def job_validate():
+        try:
+            validate_watchlist(broker, db)
+        except Exception as exc:  # noqa: BLE001
+            log.error("Bulut hisse doğrulama hatası: %s", exc)
+
+    def job_retrain():
+        try:
+            params = db.get_params()
+            syms = [w["symbol"] for w in db.watchlist(only_valid=True)]
+            if not syms:
+                return
+            bars = md.daily_bars(syms, days=1825)
+            ModelTrainer(settings.model_dir, db).train_and_register(bars, params)
+            eng._gate_cache = None
+        except Exception as exc:  # noqa: BLE001
+            log.exception("Bulut model eğitimi hatası: %s", exc)
+
+    def job_commands():
+        process_commands(db, eng, job_cycle, job_sync, job_validate, job_retrain)
+
+    def job_ollama_health():
+        if ollama is None:
+            return
+        h = ollama.health()
+        db.set_state("ollama_status", "ok" if h["online"] and h["model_available"] else "offline")
+        db.set_state("ollama_message", h["message"])
 
     def bootstrap():
         try:
@@ -94,9 +127,15 @@ def ensure_embedded_worker(settings, db, broker, md, ollama) -> bool:
     sched = BackgroundScheduler(timezone=NY_TZ, job_defaults={"coalesce": True, "max_instances": 1,
                                                               "misfire_grace_time": 120})
     sched.add_job(heartbeat, IntervalTrigger(seconds=30), id="hb")
+    # The dashboard queues button presses (incl. EMERGENCY STOP) whenever our heartbeat is fresh.
+    sched.add_job(job_commands, IntervalTrigger(seconds=3), id="commands")
     sched.add_job(job_sync, IntervalTrigger(seconds=int(p["sync_interval_seconds"])), id="sync")
+    sched.add_job(job_ollama_health, IntervalTrigger(minutes=2), id="ollama")
     sched.add_job(job_cycle, CronTrigger(day_of_week="mon-fri", hour="9-15", minute=f"*/{step}", second=20,
                                          timezone=NY_TZ), id="cycle")
+    sched.add_job(job_validate, CronTrigger(day_of_week="mon-fri", hour=8, minute=30, timezone=NY_TZ), id="validate")
+    sched.add_job(job_retrain, CronTrigger(day_of_week="sat", hour=10, minute=0, timezone=NY_TZ), id="retrain")
     sched.start()
+    _SCHEDULER = sched
     threading.Thread(target=bootstrap, daemon=True, name="qp-bootstrap").start()
     return True
