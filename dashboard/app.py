@@ -795,6 +795,38 @@ with tabs[5]:
             st.toast(dispatch(db, broker, md, ollama, settings, "emergency_stop", {"close_positions": True}))
             st.rerun()
 
+    with st.expander("🧪 Test emri (1 adet al / sat — sistemi denemek için)"):
+        st.caption("Botun kullandığı aynı Alpaca PAPER emir yolunu dener. Normal seansta piyasa emri; seans öncesi/sonrasında "
+                   "son fiyatın %1 ötesinden limit emir gönderilir (dolmazsa gün sonunda iptal olur). Test emirleri botun "
+                   "bekleme süresini ve stop emirlerini etkilemez; bot daha sonra o hisse için SAT kararı verirse test "
+                   "hissesini de satar.")
+        t_syms = [w["symbol"] for w in db.watchlist(only_valid=True)]
+        t_blocked = (not broker) or STALE_CODE or not t_syms
+        if STALE_CODE:
+            st.warning("Önce uygulamayı yeniden başlatın (Reboot app); eski kodla test emri gönderilmez.")
+        tc1, tc2, tc3 = st.columns([2, 1, 1])
+        t_sym = tc1.selectbox("Hisse", t_syms or ["—"], key="test_sym", disabled=t_blocked)
+        t_side = None
+        if tc2.button("🟢 1 adet AL", width="stretch", disabled=t_blocked, key="test_buy"):
+            t_side = "buy"
+        if tc3.button("🔴 1 adet SAT", width="stretch", disabled=t_blocked, key="test_sell"):
+            t_side = "sell"
+        if t_side:
+            from quantpilot.execution.manual import test_order
+            with st.spinner("Test emri gönderiliyor..."):
+                res_t = test_order(broker, md, db, t_sym, t_side)
+                if res_t["ok"]:
+                    try:
+                        Synchronizer(broker, db).sync_all()
+                    except Exception:  # noqa: BLE001
+                        pass
+            st.session_state["test_result"] = res_t
+        if st.session_state.get("test_result"):
+            r_t = st.session_state["test_result"]
+            (st.success if r_t["ok"] else st.error)(r_t["message"])
+            if r_t["ok"]:
+                st.caption("Emrin dolup dolmadığını 'Emirler' sekmesinden ve sol menüdeki '🔄 Senkronize Et' ile takip edin.")
+
     auto_now = db.flag("auto_trading")
     new_auto = st.toggle("Otomatik Paper Emirlerini Etkinleştir (YALNIZCA PAPER)", value=auto_now,
                          disabled=not gate_ok or db.flag("emergency_stop"))
