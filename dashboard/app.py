@@ -80,6 +80,15 @@ st.set_page_config(page_title="QuantPilot AI — NASDAQ Paper Trader", page_icon
 st.markdown(f"<style>{(Path(__file__).parent / 'theme.css').read_text(encoding='utf-8')}</style>",
             unsafe_allow_html=True)
 
+# Shown FIRST, before any code that touches quantpilot modules, so it is visible even if a later
+# section fails because the running process still has old modules loaded.
+if STALE_CODE:
+    st.markdown("<div class='qp-banner stop'>🔄 <b>Uygulamanın yeniden başlatılması gerekiyor.</b> Yeni kod yüklendi, ancak "
+                "arka planda çalışan bot ve bazı modüller hâlâ <b>eski sürümle</b> çalışıyor; yeni strateji ayarları "
+                "uygulanmıyor ve bazı bölümler hata verebilir. share.streamlit.io → uygulamanın <b>⋮</b> menüsü → "
+                "<b>Reboot app</b> ile yeniden başlatın.</div>", unsafe_allow_html=True)
+
+
 
 # ------------------------------------------------------------------ formatting
 # Chart series colors: first three slots of the categorical palette, dark-mode steps, validated
@@ -284,7 +293,7 @@ elif _ai_mode == "builtin":
 else:
     _ai_label, _ai_cls = f"Ollama ({settings.ollama_model}): Çevrimdışı", "warn"
 p_ol = f"<span class='qp-pill {_ai_cls}'>{_ai_label}</span>"
-_phase = session.phase if session else "closed"
+_phase = (getattr(session, "phase", None) or ("regular" if session.is_open else "closed")) if session else "closed"
 _mkt_cls = {"regular": "ok", "pre": "warn", "post": "warn"}.get(_phase, "neu")
 p_mkt = f"<span class='qp-pill {_mkt_cls}'>ABD Piyasası: {market_status_text(session) if session else 'DEMO'}</span>"
 p_wrk = f"<span class='qp-pill {'ok' if w_alive else 'warn'}'>Worker: {w_text}</span>"
@@ -299,12 +308,6 @@ st.markdown(f"""
   <div class="qp-pills">{p_alp}{p_ol}{p_mkt}{p_wrk}{p_auto}</div>
 </div>
 """, unsafe_allow_html=True)
-
-if STALE_CODE:
-    st.markdown("<div class='qp-banner stop'>🔄 <b>Uygulamanın yeniden başlatılması gerekiyor.</b> Yeni kod yüklendi, ancak "
-                "arka planda çalışan bot ve bazı modüller hâlâ <b>eski sürümle</b> çalışıyor; yeni strateji ayarları "
-                "uygulanmıyor ve bazı bölümler hata verebilir. share.streamlit.io → uygulamanın <b>⋮</b> menüsü → "
-                "<b>Reboot app</b> ile yeniden başlatın.</div>", unsafe_allow_html=True)
 
 if db.flag("emergency_stop"):
     st.markdown("<div class='qp-banner stop'>🛑 ACİL DURDURMA AKTİF — Tüm yeni emirler engellendi ve açık emirler iptal edildi. 'Bot Kontrolleri' sekmesinden kaldırabilirsiniz.</div>", unsafe_allow_html=True)
