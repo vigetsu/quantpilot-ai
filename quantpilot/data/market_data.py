@@ -55,10 +55,21 @@ class MarketData:
         raise RuntimeError(f"Tarihsel veri alınamadı: {last_exc}")
 
     def latest_prices(self, symbols: list[str]) -> dict[str, float]:
+        return {s: px for s, (px, _) in self.latest_trades(symbols).items()}
+
+    def latest_trades(self, symbols: list[str]) -> dict[str, tuple[float, datetime | None]]:
+        """symbol -> (last trade price, trade time UTC). The time matters outside regular hours,
+        when trades are sparse and the 'latest' trade can be hours old."""
         from alpaca.data.requests import StockLatestTradeRequest
         req = StockLatestTradeRequest(symbol_or_symbols=symbols, feed=self._feed(self.settings.data_feed))
         res = self.client.get_stock_latest_trade(req)
-        return {s: float(t.price) for s, t in res.items()}
+        out = {}
+        for s, t in res.items():
+            ts = getattr(t, "timestamp", None)
+            if isinstance(ts, datetime) and ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
+            out[s] = (float(t.price), ts if isinstance(ts, datetime) else None)
+        return out
 
 
 def split_bars(df: pd.DataFrame) -> dict[str, pd.DataFrame]:

@@ -167,11 +167,11 @@ class Worker:
         s.add_job(self.job_sync, IntervalTrigger(seconds=int(p["sync_interval_seconds"])), id="sync")
         s.add_job(self.job_ollama_health, IntervalTrigger(minutes=2), id="ollama")
         step = max(1, int(p["strategy_interval_minutes"]))
-        s.add_job(self.job_cycle, CronTrigger(day_of_week="mon-fri", hour="9-15", minute=f"*/{step}", second=20,
+        s.add_job(self.job_cycle, CronTrigger(day_of_week="mon-fri", hour="4-19", minute=f"*/{step}", second=20,
                                               timezone=NY_TZ), id="cycle")
         s.add_job(self.job_validate, CronTrigger(day_of_week="mon-fri", hour=8, minute=30, timezone=NY_TZ), id="validate")
         s.add_job(self.job_scheduled_retrain, CronTrigger(day_of_week="sat", hour=10, minute=0, timezone=NY_TZ), id="retrain")
-        log.info("Zamanlayıcı başladı (America/New_York). Strateji her %s dakikada (yalnızca normal seans).", step)
+        log.info("Zamanlayıcı başladı (America/New_York). Strateji her %s dakikada (normal seans + ayarlara göre seans öncesi/sonrası).", step)
         s.start()
 
 

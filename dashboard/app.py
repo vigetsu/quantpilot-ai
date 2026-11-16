@@ -54,6 +54,7 @@ _PARAM_FALLBACKS = {
     "use_ml": False, "use_regime_filter": False, "regime_sma": 200, "rank_by": "ml", "momentum_filter": False,
     "min_momentum": 0.0, "momentum_lookback": 126, "momentum_skip": 21, "exit_chandelier": False,
     "chandelier_period": 22, "chandelier_atr_mult": 3.0, "exit_on_ema_cross": True,
+    "extended_hours_trading": True, "extended_limit_buffer_pct": 0.003, "extended_max_price_age_min": 15,
 }
 
 
@@ -283,7 +284,9 @@ elif _ai_mode == "builtin":
 else:
     _ai_label, _ai_cls = f"Ollama ({settings.ollama_model}): Çevrimdışı", "warn"
 p_ol = f"<span class='qp-pill {_ai_cls}'>{_ai_label}</span>"
-p_mkt = f"<span class='qp-pill {'ok' if (session and session.is_open) else 'neu'}'>ABD Piyasası: {market_status_text(session) if session else 'DEMO'}</span>"
+_phase = session.phase if session else "closed"
+_mkt_cls = {"regular": "ok", "pre": "warn", "post": "warn"}.get(_phase, "neu")
+p_mkt = f"<span class='qp-pill {_mkt_cls}'>ABD Piyasası: {market_status_text(session) if session else 'DEMO'}</span>"
 p_wrk = f"<span class='qp-pill {'ok' if w_alive else 'warn'}'>Worker: {w_text}</span>"
 p_auto = f"<span class='qp-pill {'ok' if (db.flag('auto_trading') and not db.flag('emergency_stop')) else 'bad'}'>Oto. Paper Emir: {'AÇIK' if (db.flag('auto_trading') and not db.flag('emergency_stop')) else 'KAPALI'}</span>"
 
@@ -343,6 +346,10 @@ with st.expander("ℹ️ Notlar ve sınırlamalar (açıklama modu, veri akış�
                 "olmazsa IEX'ten çekilir.")
     st.markdown("**Stop-loss:** Stop emri tetiklenince piyasa emrine dönüşür; fiyat boşluklarında (gap) stop fiyatından "
                 "dolum **garanti edilmez**.")
+    st.markdown("**Seans saatleri (Türkiye saati, kış):** seans öncesi 12:00–17:30 · normal seans 17:30–00:00 · "
+                "seans sonrası 00:00–04:00 (yaz saatinde 1 saat erken). Seans dışında bot yalnızca limit emir verir, "
+                "son işlem 15 dakikadan eskiyse emir vermez ve stop seviyesini kendisi kontrol eder. Strateji ve "
+                "backtest günlük kapanış verisiyle kurulduğu için seans dışı işlemler backtest'e yansımaz.")
 
 # ------------------------------------------------------------------ sidebar
 with st.sidebar:
@@ -819,6 +826,11 @@ with tabs[5]:
         rank_mom = g1.checkbox("Momentuma göre sırala", value=params["rank_by"] == "momentum", help="Nakit/maruziyet sınırlıyken önce son 6 ayda (son ay hariç) en çok yükselen hisseler alınır.")
         mom_filter = g2.checkbox("Pozitif momentum şartı", value=bool(params["momentum_filter"]), help="Yalnızca 6 aylık (son ay hariç) getirisi pozitif hisseler alınır. Testlerde fayda göstermedi.")
         exit_ema = g2.checkbox("EMA kesişiminde sat", value=bool(params["exit_on_ema_cross"]))
+        ext_on = g3.checkbox("Seans öncesi/sonrası işlem", value=bool(params["extended_hours_trading"]),
+                             help="Seans öncesi (TSİ 12:00–17:30) ve sonrası (TSİ 00:00–04:00) da işlem yapar. "
+                                  "Bu saatlerde yalnızca limit emir verilir (son fiyat ±%0,3), son işlem 15 dakikadan "
+                                  "eskiyse emir verilmez; broker stop emirleri tetiklenmediği için stop seviyesi bot "
+                                  "tarafından her döngüde kontrol edilir. Hacim düşük, fiyat farkları geniştir.")
         exit_ch = g3.checkbox("İz süren stop (Chandelier)", value=bool(params["exit_chandelier"]), help="Kapanış, son 22 günün en yüksek fiyatı − 3×ATR seviyesinin altına inerse ertesi gün satılır.")
         if st.form_submit_button("💾 Parametreleri Kaydet"):
             if not exit_ema and not exit_ch:
@@ -829,7 +841,8 @@ with tabs[5]:
                            "place_stop_orders": place_stops, "max_position_pct": max_pos, "max_exposure_pct": max_exp,
                            "max_risk_per_trade_pct": max_rsk, "max_daily_drawdown_pct": max_dd, "cooldown_minutes": cooldown,
                            "use_regime_filter": use_regime, "rank_by": "momentum" if rank_mom else "ml",
-                           "momentum_filter": mom_filter, "exit_on_ema_cross": exit_ema, "exit_chandelier": exit_ch})
+                           "momentum_filter": mom_filter, "exit_on_ema_cross": exit_ema, "exit_chandelier": exit_ch,
+                           "extended_hours_trading": ext_on})
             st.success("Parametreler kaydedildi.")
             st.rerun()
 

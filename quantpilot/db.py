@@ -51,6 +51,11 @@ DEFAULT_PARAMS: dict[str, Any] = {
     "entry_skip_open_minutes": 5,
     "entry_skip_close_minutes": 5,
     "place_stop_orders": True,
+    # extended hours (pre-market 04:00-09:30 ET, after-hours 16:00-20:00 ET): limit orders only,
+    # broker stop orders do not trigger -> software stop each cycle; stale prices block orders
+    "extended_hours_trading": True,
+    "extended_limit_buffer_pct": 0.003,   # buy limit = last * (1+x), sell limit = last * (1-x)
+    "extended_max_price_age_min": 15,     # last trade older than this => no order in extended hours
     # scheduling
     "strategy_interval_minutes": 15,
     "sync_interval_seconds": 60,

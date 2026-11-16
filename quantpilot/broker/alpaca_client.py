@@ -211,6 +211,22 @@ class AlpacaBroker:
                                  client_order_id=client_order_id, extended_hours=False)
         return self._submit(req, client_order_id)
 
+    def submit_extended_limit_order(self, symbol: str, qty: int, side: str, limit_price: float,
+                                    client_order_id: str) -> dict:
+        """DAY limit order eligible for pre-market / after-hours (Alpaca accepts only limit orders there).
+
+        An unfilled order stays live through the rest of the day's sessions and then expires."""
+        from alpaca.trading.enums import OrderSide, TimeInForce
+        from alpaca.trading.requests import LimitOrderRequest
+        if qty <= 0 or int(qty) != qty:
+            raise OrderRejected("Miktar pozitif tam sayı olmalı.")
+        px = round(float(limit_price), 2 if limit_price >= 1 else 4)
+        if px <= 0:
+            raise OrderRejected("Geçersiz limit fiyatı.")
+        req = LimitOrderRequest(symbol=symbol, qty=int(qty), side=OrderSide(side), time_in_force=TimeInForce.DAY,
+                                limit_price=px, client_order_id=client_order_id, extended_hours=True)
+        return self._submit(req, client_order_id)
+
     def submit_stop_order(self, symbol: str, qty: int, stop_price: float, client_order_id: str) -> dict:
         """Protective SELL stop (GTC). Note: a stop becomes a market order when triggered
         and may fill well below the stop price (gaps, fast markets)."""

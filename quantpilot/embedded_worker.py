@@ -135,7 +135,7 @@ def ensure_embedded_worker(settings, db, broker, md, ollama) -> bool:
     sched.add_job(job_commands, IntervalTrigger(seconds=3), id="commands")
     sched.add_job(job_sync, IntervalTrigger(seconds=int(p["sync_interval_seconds"])), id="sync")
     sched.add_job(job_ollama_health, IntervalTrigger(minutes=2), id="ollama")
-    sched.add_job(job_cycle, CronTrigger(day_of_week="mon-fri", hour="9-15", minute=f"*/{step}", second=20,
+    sched.add_job(job_cycle, CronTrigger(day_of_week="mon-fri", hour="4-19", minute=f"*/{step}", second=20,
                                          timezone=NY_TZ), id="cycle")
     sched.add_job(job_validate, CronTrigger(day_of_week="mon-fri", hour=8, minute=30, timezone=NY_TZ), id="validate")
     sched.add_job(job_scheduled_retrain, CronTrigger(day_of_week="sat", hour=10, minute=0, timezone=NY_TZ), id="retrain")

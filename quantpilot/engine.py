@@ -98,10 +98,15 @@ class TradingEngine:
     def run_cycle(self, force_eval: bool = False) -> dict:
         params = self.db.get_params()
         session = get_session(self.broker)
+        phase = session.phase
+        # extended = pre-market / after-hours trading with limit orders (opt-out in the dashboard)
+        extended = bool(params.get("extended_hours_trading", False)) and phase in ("pre", "post")
+        tradable = session.is_open or extended
         self.db.set_state("market_open", session.is_open)
-        if not session.is_open and not force_eval:
-            return {"skipped": "market_closed"}
-        summary = {"ts": utcnow(), "signals": [], "orders": []}
+        self.db.set_state("market_phase", phase)
+        if not tradable and not force_eval:
+            return {"skipped": "market_closed", "phase": phase}
+        summary = {"ts": utcnow(), "signals": [], "orders": [], "phase": phase}
 
         sync_res = self.sync.sync_all()
         account = sync_res["account"]
@@ -115,7 +120,10 @@ class TradingEngine:
         raw = self.md.daily_bars(fetch, days=500)
         self.db.set_state("last_data_update", utcnow())
         self.db.set_state("active_feed", f"tarihsel={self.md.last_feed_used}, anlık={self.settings.data_feed}")
-        bars = {s: completed_daily_bars(df, session.now_ny, session.is_open) for s, df in raw.items()}
+        # Today's daily bar is still forming during the regular session and does not exist yet (or is
+        # partial) in pre-market; after the close it is complete and may be used (signal at close t).
+        drop_today = session.is_open or phase == "pre"
+        bars = {s: completed_daily_bars(df, session.now_ny, drop_today) for s, df in raw.items()}
         regime_ok = None  # unknown => the rule blocks new entries (fail safe)
         if use_regime:
             qb = bars.get(REGIME_SYMBOL)
@@ -126,11 +134,25 @@ class TradingEngine:
             self.db.set_state("market_regime", "unknown" if regime_ok is None else ("risk_on" if regime_ok else "risk_off"))
             if REGIME_SYMBOL not in symbols:
                 bars.pop(REGIME_SYMBOL, None)
+        stale: dict[str, str] = {}
         try:
-            prices = self.md.latest_prices(symbols)
+            if extended:
+                # Trades are sparse outside regular hours: only use a last trade that is recent enough.
+                max_age = float(params.get("extended_max_price_age_min", 15))
+                now_utc = session.now_ny.astimezone(timezone.utc)
+                prices = {}
+                for s, (px, ts) in self.md.latest_trades(symbols).items():
+                    age = (now_utc - ts).total_seconds() / 60 if ts else None
+                    if age is not None and age <= max_age:
+                        prices[s] = px
+                    else:
+                        stale[s] = "bilinmiyor" if age is None else f"{age:.0f} dk"
+            else:
+                prices = self.md.latest_prices(symbols)
         except Exception as exc:  # noqa: BLE001
-            log.warning("Anlık fiyat alınamadı - yeni giriş yapılmayacak: %s", exc)
+            log.warning("Anlık fiyat alınamadı - yeni emir verilmeyecek: %s", exc)
             prices = {}
+        buf = float(params.get("extended_limit_buffer_pct", 0.003))
 
         predictor = load_active_predictor(self.db) if params.get("use_ml", True) else None
         probs = predictor.predict_latest(bars, params) if predictor else {}
@@ -164,30 +186,39 @@ class TradingEngine:
         for sym, row, bar_date, prob, dec in evaluated:
             price = prices.get(sym)
             ctx = RiskContext(auto_trading=self.db.flag("auto_trading"), emergency_stop=self.db.flag("emergency_stop"),
-                              bot_running=self.db.flag("bot_running"), market_open=session.is_open,
-                              in_entry_window=session.in_entry_window(int(params["entry_skip_open_minutes"]),
-                                                                      int(params["entry_skip_close_minutes"])),
+                              bot_running=self.db.flag("bot_running"), market_open=tradable,
+                              in_entry_window=(True if extended else
+                                               session.in_entry_window(int(params["entry_skip_open_minutes"]),
+                                                                       int(params["entry_skip_close_minutes"]))),
                               asset_ok=sym in valid_set, safety_gate_ok=gate_ok,
                               now=session.now_ny.astimezone(timezone.utc))
             rd, coid, result = None, None, None
             rd_notes: list[str] = []
+            no_px = (f"Seans dışı: son işlem fiyatı çok eski ({stale[sym]}) - emir verilmedi" if sym in stale
+                     else "Anlık fiyat yok - emir verilmedi")
             if dec.action == "BUY":
                 if price is None:
-                    rd_notes = ["Anlık fiyat yok - giriş atlandı"]
+                    rd_notes = [no_px]
                     rd = None
                 else:
                     rd = check_entry(sym, price, float(row["atr"]), state, ctx, params)
                     coid = make_client_order_id(sym, "buy", bar_date)
             elif dec.action == "SELL":
-                rd = check_exit(sym, state, ctx)
-                coid = make_client_order_id(sym, "sell", bar_date)
+                if extended and price is None:
+                    rd_notes = [no_px]  # a limit sell needs a fresh reference price
+                else:
+                    rd = check_exit(sym, state, ctx)
+                    coid = make_client_order_id(sym, "sell", bar_date)
+            if rd is not None and rd.approved and extended:
+                rd.notes.append(f"Seans dışı ({'seans öncesi' if phase == 'pre' else 'seans sonrası'}): "
+                                f"limit emir, son fiyat ±%{buf * 100:.1f}")
             indicators = {k: (None if row.get(k) is None or (isinstance(row.get(k), float) and math.isnan(row[k]))
                               else float(row[k])) for k in IND_KEYS}
             sig = {"symbol": sym, "bar_date": bar_date, "action": dec.action, "price": price or row["close"],
                    "indicators": indicators, "ml_prob": prob, "model_version": predictor.version if predictor else None,
                    "reasons": dec.reasons + [f"Çelişki: {c}" for c in dec.conflicts],
                    "risk_approved": None if rd is None else int(rd.approved),
-                   "risk_notes": (rd.notes if rd else (rd_notes if dec.action == "BUY" and price is None else [])),
+                   "risk_notes": (rd.notes if rd else rd_notes),
                    "qty": rd.qty if rd else None, "client_order_id": coid if rd and rd.approved else None}
             signal_id = self.db.add_signal(sig)
             summary["signals"].append({"symbol": sym, "action": dec.action, "ml_prob": prob,
@@ -199,9 +230,11 @@ class TradingEngine:
                     if not self.exec.cancel_symbol_orders(sym, open_orders):
                         log.warning("%s açık emirleri iptal edilemedi - satış ertelendi", sym)
                         continue
-                    result = self.exec.execute(rd, sym, "sell", coid, price, reason, signal_id)
+                    result = self.exec.execute(rd, sym, "sell", coid, price, reason, signal_id,
+                                               limit_price=price * (1 - buf) if extended else None)
                 else:
-                    result = self.exec.execute(rd, sym, "buy", coid, price, reason, signal_id)
+                    result = self.exec.execute(rd, sym, "buy", coid, price, reason, signal_id,
+                                               limit_price=price * (1 + buf) if extended else None)
                     if result.get("state") in ("submitted", "unknown"):
                         state.open_orders.append({"symbol": sym, "side": "buy", "qty": rd.qty, "ref_price": price})
                 summary["orders"].append({"symbol": sym, "side": dec.action, "state": result.get("state"),
@@ -211,7 +244,16 @@ class TradingEngine:
         if params.get("place_stop_orders", True) and self.db.flag("auto_trading") and not self.db.flag("emergency_stop"):
             self.sync.sync_all()
             open_now = [o for o in self.db.orders(limit=1000) if o["status"] in OPEN_STATUSES]
-            acts = self.exec.ensure_protective_stops(self.db.positions(), open_now)
+            acts = []
+            if extended:
+                # Broker stop orders do not trigger outside regular hours -> enforce the stop ourselves.
+                # Runs BEFORE placing missing GTC stops, so it never races a stop it did not see.
+                key = f"{session.now_ny:%Y%m%d}{phase}"
+                acts += self.exec.software_stops(self.db.positions(), open_now, prices, key, buf)
+                if acts:
+                    self.sync.sync_all()
+                    open_now = [o for o in self.db.orders(limit=1000) if o["status"] in OPEN_STATUSES]
+            acts += self.exec.ensure_protective_stops(self.db.positions(), open_now)
             if acts:
                 summary["orders"].extend({"stop": a} for a in acts)
         self._queue_portfolio_ai(account, summary)
