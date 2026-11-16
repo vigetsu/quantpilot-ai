@@ -7,3 +7,12 @@ gatherUsageStats = false
 [server]
 address = "localhost"
 port = 8501
+
+# Streamlit'in kendi bileşenleri (butonlar, sekmeler, kenar çubuğu, tablolar) da koyu temada
+# çizilsin; aksi halde dashboard/theme.css koyu arka plan üzerinde açık tema yazıları okunmuyor.
+[theme]
+base = "dark"
+primaryColor = "#3987e5"
+backgroundColor = "#090d16"
+secondaryBackgroundColor = "#0f1626"
+textColor = "#e5e7eb"

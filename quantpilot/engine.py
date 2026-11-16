@@ -16,7 +16,7 @@ from quantpilot.broker.sync import OPEN_STATUSES, Synchronizer
 from quantpilot.data.market_data import completed_daily_bars
 from quantpilot.db import Database, utcnow
 from quantpilot.execution.executor import OrderExecutor, make_client_order_id
-from quantpilot.ml.model import load_active_predictor
+from quantpilot.ml.model import load_active_predictor, resolve_model_path
 from quantpilot.risk.engine import PortfolioState, RiskContext, check_entry, check_exit
 from quantpilot.risk.selftest import run_self_test
 from quantpilot.scheduler.calendar import get_session
@@ -44,8 +44,9 @@ def safety_gate(db: Database, broker, params: dict) -> tuple[bool, list[str]]:
     msgs.append(("✅" if has_bt else "❌") + " En az bir backtest çalıştırıldı")
     ok &= has_bt
     if params.get("use_ml", True):
-        has_model = db.active_model() is not None
-        msgs.append(("✅" if has_model else "❌") + " Aktif ML modeli mevcut")
+        rec = db.active_model()
+        has_model = rec is not None and resolve_model_path(rec["path"]) is not None
+        msgs.append(("✅" if has_model else "❌") + " Aktif ML modeli mevcut (dosya bulundu)")
         ok &= has_model
     st_ok, st_msgs = run_self_test(params)
     msgs.append(("✅" if st_ok else "❌") + " Risk motoru öz-testi")
@@ -128,6 +129,10 @@ class TradingEngine:
         gate_ok, _ = self.gate(params)
         valid_set = set(symbols)
 
+        # Pass 1: evaluate every symbol. Pass 2: act - exits/holds first, then BUY candidates
+        # ranked by ML probability (highest first), exactly like the backtester, so that when
+        # exposure/cash is limited the strongest signals get capital (not alphabetical order).
+        evaluated = []
         for sym in symbols:
             df = bars.get(sym)
             if df is None or len(df) < 60:
@@ -137,6 +142,10 @@ class TradingEngine:
             bar_date = str(ind.index[-1].date()) if hasattr(ind.index[-1], "date") else str(ind.index[-1])
             prob = probs.get(sym)
             dec = evaluate(row, params, sym in positions and positions[sym]["qty"] > 0, prob)
+            evaluated.append((sym, row, bar_date, prob, dec))
+        evaluated.sort(key=lambda e: (e[4].action == "BUY", -(e[3] if e[3] is not None else 0.0)))
+
+        for sym, row, bar_date, prob, dec in evaluated:
             price = prices.get(sym)
             ctx = RiskContext(auto_trading=self.db.flag("auto_trading"), emergency_stop=self.db.flag("emergency_stop"),
                               bot_running=self.db.flag("bot_running"), market_open=session.is_open,
@@ -145,6 +154,7 @@ class TradingEngine:
                               asset_ok=sym in valid_set, safety_gate_ok=gate_ok,
                               now=session.now_ny.astimezone(timezone.utc))
             rd, coid, result = None, None, None
+            rd_notes: list[str] = []
             if dec.action == "BUY":
                 if price is None:
                     rd_notes = ["Anlık fiyat yok - giriş atlandı"]
@@ -205,7 +215,7 @@ class TradingEngine:
         def job():
             ok, text, lat = self.ollama.chat(signal_prompt(sym, dec.action, indicators, prob, dec.reasons,
                                                            dec.conflicts, risk_notes))
-            self.db.add_ai_analysis("signal", sym, self.ollama.model, ok, text, lat)
+            self.db.add_ai_analysis("signal", sym, self.ollama.source_label(), ok, text, lat)
             if ok:
                 self.db.set_signal_ai(signal_id, text)
             self.db.set_state("ollama_status", "ok" if ok else "offline")
@@ -225,6 +235,6 @@ class TradingEngine:
 
         def job():
             ok, text, lat = self.ollama.chat(portfolio_prompt(data))
-            self.db.add_ai_analysis("portfolio", None, self.ollama.model, ok, text, lat)
+            self.db.add_ai_analysis("portfolio", None, self.ollama.source_label(), ok, text, lat)
             self.db.set_state("ollama_status", "ok" if ok else "offline")
         self._ai_pool.submit(job)

@@ -20,6 +20,7 @@ from apscheduler.triggers.interval import IntervalTrigger
 
 from quantpilot.ai.ollama_client import OllamaClient
 from quantpilot.broker.alpaca_client import AlpacaBroker
+from quantpilot.commands import process_commands
 from quantpilot.config import ConfigError, load_settings
 from quantpilot.data.market_data import MarketData
 from quantpilot.data.universe import validate_watchlist
@@ -136,42 +137,7 @@ class Worker:
             log.exception("Model eğitimi başarısız: %s", exc)
 
     def job_commands(self):
-        for cmd in self.db.pending_commands():
-            name, payload = cmd["command"], json.loads(cmd["payload"] or "{}")
-            try:
-                if name == "start":
-                    self.db.set_state("bot_running", True)
-                    result = "Bot başlatıldı"
-                elif name == "pause":
-                    self.db.set_state("bot_running", False)
-                    result = "Bot duraklatıldı"
-                elif name == "emergency_stop":
-                    result = self.engine.exec.emergency_stop(close_positions=bool(payload.get("close_positions")))
-                elif name == "clear_emergency":
-                    self.db.set_state("emergency_stop", False)
-                    result = "Acil durdurma kaldırıldı (otomatik emirler kapalı kalır)"
-                elif name == "run_cycle":
-                    threading.Thread(target=self.job_cycle, kwargs={"force": True}, daemon=True).start()
-                    result = "Döngü başlatıldı"
-                elif name == "sync":
-                    self.job_sync()
-                    result = "Senkronize edildi"
-                elif name == "validate_watchlist":
-                    self.job_validate()
-                    result = "Doğrulandı"
-                elif name == "retrain":
-                    threading.Thread(target=self.job_retrain, daemon=True).start()
-                    result = "Eğitim başlatıldı"
-                elif name == "refresh_gate":
-                    self.engine._gate_cache = None
-                    result = "Güvenlik kontrolleri yenilenecek"
-                else:
-                    result = f"Bilinmeyen komut: {name}"
-            except Exception as exc:  # noqa: BLE001
-                result = f"Hata: {exc}"
-                log.exception("Komut hatası %s", name)
-            self.db.complete_command(cmd["id"], result)
-            log.info("Komut işlendi: %s -> %s", name, result)
+        process_commands(self.db, self.engine, self.job_cycle, self.job_sync, self.job_validate, self.job_retrain)
 
     # -------------------------------------------------------------- main
     def startup(self):
