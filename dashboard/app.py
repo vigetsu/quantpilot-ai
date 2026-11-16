@@ -766,7 +766,7 @@ with tabs[5]:
         ema_slow = f1.number_input("Yavaş EMA", 20, 250, int(params["ema_slow"]))
         rsi_min = f1.number_input("RSI Giriş Alt Sınır", 20.0, 70.0, float(params["rsi_entry_min"]), 1.0)
         rsi_max = f1.number_input("RSI Giriş Üst Sınır", 40.0, 85.0, float(params["rsi_entry_max"]), 1.0)
-        use_ml = f2.checkbox("ML Olasılık Filtresini Kullan", value=bool(params["use_ml"]))
+        use_ml = f2.checkbox("ML filtresi (önerilmez)", value=bool(params["use_ml"]), help="2017–2026 testlerinde modelin örneklem dışı ROC-AUC değeri 0,47–0,50 çıktı (tahmin gücü yok) ve ML filtresi getiriyi düşürdü.")
         ml_thr = f2.slider("Minimum ML Olasılığı", 0.50, 0.80, float(params["ml_prob_threshold"]), 0.01)
         atr_mult = f2.number_input("ATR Stop Çarpanı", 1.0, 5.0, float(params["atr_stop_mult"]), 0.25)
         place_stops = f2.checkbox("Dolum Sonrası Koruyucu Stop Emri Gönder", value=bool(params["place_stop_orders"]))
@@ -775,11 +775,27 @@ with tabs[5]:
         max_rsk = f3.slider("İşlem Başına Maks. Planlanan Risk (%)", 0.2, HARD_LIMITS["max_risk_per_trade_pct"] * 100, float(params["max_risk_per_trade_pct"] * 100), 0.1) / 100
         max_dd = f3.slider("Günlük Düşüş Durdurma Limiti (%)", 0.5, HARD_LIMITS["max_daily_drawdown_pct"] * 100, float(params["max_daily_drawdown_pct"] * 100), 0.5) / 100
         cooldown = f3.number_input("İşlemler Arası Bekleme Süresi (dakika)", 0, 10080, int(params["cooldown_minutes"]), 60)
+
+        st.markdown("**Ek kurallar (isteğe bağlı)** — 2017–2026 gerçek veri testlerinde karışık sonuç verdi: "
+                    "geniş 44 hisselik listede ve düşüşlerde daha iyi, varsayılan 8 hisselik listede getiride daha zayıf. "
+                    "Açmadan önce 'Backtest & ML' sekmesinde kendi listenizle karşılaştırın.")
+        g1, g2, g3 = st.columns(3)
+        use_regime = g1.checkbox("Piyasa rejimi filtresi", value=bool(params["use_regime_filter"]),
+                                 help="QQQ 200 günlük ortalamasının altındayken yeni alım yapılmaz. Satışlar etkilenmez.")
+        rank_mom = g1.checkbox("Momentuma göre sırala", value=params["rank_by"] == "momentum", help="Nakit/maruziyet sınırlıyken önce son 6 ayda (son ay hariç) en çok yükselen hisseler alınır.")
+        mom_filter = g2.checkbox("Pozitif momentum şartı", value=bool(params["momentum_filter"]), help="Yalnızca 6 aylık (son ay hariç) getirisi pozitif hisseler alınır. Testlerde fayda göstermedi.")
+        exit_ema = g2.checkbox("EMA kesişiminde sat", value=bool(params["exit_on_ema_cross"]))
+        exit_ch = g3.checkbox("İz süren stop (Chandelier)", value=bool(params["exit_chandelier"]), help="Kapanış, son 22 günün en yüksek fiyatı − 3×ATR seviyesinin altına inerse ertesi gün satılır.")
         if st.form_submit_button("💾 Parametreleri Kaydet"):
+            if not exit_ema and not exit_ch:
+                st.error("En az bir satış kuralı (EMA kesişimi veya iz süren stop) açık olmalı.")
+                st.stop()
             db.set_params({"ema_fast": ema_fast, "ema_slow": ema_slow, "rsi_entry_min": rsi_min, "rsi_entry_max": rsi_max,
                            "use_ml": use_ml, "ml_prob_threshold": ml_thr, "atr_stop_mult": atr_mult,
                            "place_stop_orders": place_stops, "max_position_pct": max_pos, "max_exposure_pct": max_exp,
-                           "max_risk_per_trade_pct": max_rsk, "max_daily_drawdown_pct": max_dd, "cooldown_minutes": cooldown})
+                           "max_risk_per_trade_pct": max_rsk, "max_daily_drawdown_pct": max_dd, "cooldown_minutes": cooldown,
+                           "use_regime_filter": use_regime, "rank_by": "momentum" if rank_mom else "ml",
+                           "momentum_filter": mom_filter, "exit_on_ema_cross": exit_ema, "exit_chandelier": exit_ch})
             st.success("Parametreler kaydedildi.")
             st.rerun()
 

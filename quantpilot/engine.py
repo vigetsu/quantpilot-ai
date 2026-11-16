@@ -20,10 +20,11 @@ from quantpilot.ml.model import load_active_predictor, resolve_model_path
 from quantpilot.risk.engine import PortfolioState, RiskContext, check_entry, check_exit
 from quantpilot.risk.selftest import run_self_test
 from quantpilot.scheduler.calendar import get_session
-from quantpilot.strategy.indicators import compute_indicators
-from quantpilot.strategy.rules import evaluate
+from quantpilot.strategy.indicators import compute_indicators, market_regime
+from quantpilot.strategy.rules import evaluate, rank_score
 
 log = logging.getLogger("quantpilot.engine")
+REGIME_SYMBOL = "QQQ"
 IND_KEYS = ["close", "ema_fast", "ema_slow", "rsi", "macd", "macd_signal", "macd_hist", "atr", "hv20", "vol_ratio",
             "mom_10", "mom_20", "trend_strength"]
 
@@ -109,10 +110,22 @@ class TradingEngine:
             log.warning("Doğrulanmış hisse yok - döngü atlandı")
             return {"skipped": "no_symbols"}
 
-        raw = self.md.daily_bars(symbols, days=500)
+        use_regime = bool(params.get("use_regime_filter", False))
+        fetch = list(dict.fromkeys(symbols + ([REGIME_SYMBOL] if use_regime else [])))
+        raw = self.md.daily_bars(fetch, days=500)
         self.db.set_state("last_data_update", utcnow())
         self.db.set_state("active_feed", f"tarihsel={self.md.last_feed_used}, anlık={self.settings.data_feed}")
         bars = {s: completed_daily_bars(df, session.now_ny, session.is_open) for s, df in raw.items()}
+        regime_ok = None  # unknown => the rule blocks new entries (fail safe)
+        if use_regime:
+            qb = bars.get(REGIME_SYMBOL)
+            if qb is not None and len(qb):
+                reg = market_regime(qb, int(params.get("regime_sma", 200))).dropna()
+                if len(reg):
+                    regime_ok = bool(reg.iloc[-1])
+            self.db.set_state("market_regime", "unknown" if regime_ok is None else ("risk_on" if regime_ok else "risk_off"))
+            if REGIME_SYMBOL not in symbols:
+                bars.pop(REGIME_SYMBOL, None)
         try:
             prices = self.md.latest_prices(symbols)
         except Exception as exc:  # noqa: BLE001
@@ -139,11 +152,14 @@ class TradingEngine:
                 continue
             ind = compute_indicators(df, params)
             row = ind.iloc[-1].to_dict()
+            if use_regime:
+                row["regime_ok"] = regime_ok
             bar_date = str(ind.index[-1].date()) if hasattr(ind.index[-1], "date") else str(ind.index[-1])
             prob = probs.get(sym)
             dec = evaluate(row, params, sym in positions and positions[sym]["qty"] > 0, prob)
             evaluated.append((sym, row, bar_date, prob, dec))
-        evaluated.sort(key=lambda e: (e[4].action == "BUY", -(e[3] if e[3] is not None else 0.0)))
+        # same priority function as the backtester (ML probability or 6-1 month momentum)
+        evaluated.sort(key=lambda e: (e[4].action == "BUY", -rank_score(e[3], e[1], params)))
 
         for sym, row, bar_date, prob, dec in evaluated:
             price = prices.get(sym)
