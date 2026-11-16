@@ -4,7 +4,7 @@ from __future__ import annotations
 import json
 import logging
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 
 import joblib
 import numpy as np
@@ -163,12 +163,31 @@ class Predictor:
         return out
 
 
-def load_active_predictor(db) -> Predictor | None:
+def resolve_model_path(stored: str | None, model_dir: Path | None = None) -> Path | None:
+    """Find a registered model file even if it was registered on another machine/OS.
+
+    The registry stores absolute paths (e.g. ``C:\\Users\\...\\models\\vX.joblib`` from Windows),
+    which do not exist on Streamlit Cloud / Linux. Fall back to the same file name in the
+    project's ``models`` directory.
+    """
+    if not stored:
+        return None
+    p = Path(stored)
+    if p.exists():
+        return p
+    name = PureWindowsPath(stored).name if "\\" in stored else p.name
+    base = Path(model_dir) if model_dir else Path(__file__).resolve().parent.parent.parent / "models"
+    cand = base / name
+    return cand if cand.exists() else None
+
+
+def load_active_predictor(db, model_dir: Path | None = None) -> Predictor | None:
     rec = db.active_model()
-    if not rec or not Path(rec["path"]).exists():
+    path = resolve_model_path(rec["path"], model_dir) if rec else None
+    if path is None:
         return None
     try:
-        return Predictor(rec["path"])
+        return Predictor(path)
     except Exception as exc:  # noqa: BLE001
         log.error("Model yüklenemedi: %s", exc)
         return None

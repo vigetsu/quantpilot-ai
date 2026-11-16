@@ -1,16 +1,21 @@
 name: QuantPilot AI - 24/7 Cloud Paper Trader
 
+# NOT: Otomatik zamanlama (schedule) ve her push'ta calisma KAPATILDI.
+# Streamlit Cloud uygulamasi zaten kendi icinde 7/24 paper worker calistiriyor
+# (quantpilot/embedded_worker.py). Bu is akisi AYRI bir SQLite veritabani kullandigi icin
+# ikisi birlikte calisirsa ayni Alpaca hesabinda iki bagimsiz bot islem yapar ve paneldeki
+# "Acil Durdur" bu botu DURDURAMAZ. Yalnizca Streamlit kullanilmiyorsa, asagidaki schedule
+# satirlarini geri acin ve Streamlit uygulamasini kapatin.
+#
+#  schedule:
+#    - cron: "*/15 13-21 * * 1-5"
 "on":
-  schedule:
-    - cron: "*/15 13-21 * * 1-5"
   workflow_dispatch:
     inputs:
       force_eval:
         description: "Piyasa kapali olsa bile sinyal taramasini zorla"
         required: false
         default: "true"
-  push:
-    branches: ["master", "main"]
 
 concurrency:
   group: quantpilot-paper-worker
