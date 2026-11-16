@@ -77,3 +77,9 @@ def test_buy_candidates_ranked_by_ml_probability(settings, broker, fake_client, 
     res = eng.run_cycle()
     buys = [o for o in res["orders"] if o.get("side") == "BUY" and o.get("state") == "submitted"]
     assert [o["symbol"] for o in buys] == ["MSFT"], res
+
+
+def test_code_fingerprint_matches_loaded_code():
+    import quantpilot
+    assert quantpilot.LOADED_FINGERPRINT == quantpilot.code_fingerprint()
+    assert len(quantpilot.LOADED_FINGERPRINT) == 12
