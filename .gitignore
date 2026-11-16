@@ -9,6 +9,3 @@ __pycache__/
 /data/*-wal
 /logs/
 
-
-# Gezi Albümü uygulaması verileri (fotoğraflar + veritabanı)
-/travel_photos/data/
