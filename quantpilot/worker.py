@@ -136,6 +136,11 @@ class Worker:
         except Exception as exc:  # noqa: BLE001
             log.exception("Model eğitimi başarısız: %s", exc)
 
+    def job_scheduled_retrain(self):
+        # Weekly retrain only matters while the (opt-in) ML filter is in use.
+        if self.db.get_params().get("use_ml", False):
+            self.job_retrain()
+
     def job_commands(self):
         process_commands(self.db, self.engine, self.job_cycle, self.job_sync, self.job_validate, self.job_retrain)
 
@@ -165,7 +170,7 @@ class Worker:
         s.add_job(self.job_cycle, CronTrigger(day_of_week="mon-fri", hour="9-15", minute=f"*/{step}", second=20,
                                               timezone=NY_TZ), id="cycle")
         s.add_job(self.job_validate, CronTrigger(day_of_week="mon-fri", hour=8, minute=30, timezone=NY_TZ), id="validate")
-        s.add_job(self.job_retrain, CronTrigger(day_of_week="sat", hour=10, minute=0, timezone=NY_TZ), id="retrain")
+        s.add_job(self.job_scheduled_retrain, CronTrigger(day_of_week="sat", hour=10, minute=0, timezone=NY_TZ), id="retrain")
         log.info("Zamanlayıcı başladı (America/New_York). Strateji her %s dakikada (yalnızca normal seans).", step)
         s.start()
 

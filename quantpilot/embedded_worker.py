@@ -82,6 +82,10 @@ def ensure_embedded_worker(settings, db, broker, md, ollama) -> bool:
         except Exception as exc:  # noqa: BLE001
             log.exception("Bulut model eğitimi hatası: %s", exc)
 
+    def job_scheduled_retrain():
+        if db.get_params().get("use_ml", False):  # weekly retrain only while the ML filter is in use
+            job_retrain()
+
     def job_commands():
         process_commands(db, eng, job_cycle, job_sync, job_validate, job_retrain)
 
@@ -134,7 +138,7 @@ def ensure_embedded_worker(settings, db, broker, md, ollama) -> bool:
     sched.add_job(job_cycle, CronTrigger(day_of_week="mon-fri", hour="9-15", minute=f"*/{step}", second=20,
                                          timezone=NY_TZ), id="cycle")
     sched.add_job(job_validate, CronTrigger(day_of_week="mon-fri", hour=8, minute=30, timezone=NY_TZ), id="validate")
-    sched.add_job(job_retrain, CronTrigger(day_of_week="sat", hour=10, minute=0, timezone=NY_TZ), id="retrain")
+    sched.add_job(job_scheduled_retrain, CronTrigger(day_of_week="sat", hour=10, minute=0, timezone=NY_TZ), id="retrain")
     sched.start()
     _SCHEDULER = sched
     threading.Thread(target=bootstrap, daemon=True, name="qp-bootstrap").start()

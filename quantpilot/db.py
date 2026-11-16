@@ -20,7 +20,22 @@ DEFAULT_PARAMS: dict[str, Any] = {
     "rsi_entry_min": 45.0,
     "rsi_entry_max": 70.0,
     "ml_prob_threshold": 0.55,
-    "use_ml": True,
+    # OFF by default: on 2017-2026 real data the walk-forward model had out-of-sample ROC-AUC
+    # 0.47-0.50 (no edge) and the ML filter LOWERED backtest returns vs. the same rules without it.
+    "use_ml": False,
+    # Optional rule set (opt-in; see dashboard). Mixed out-of-sample evidence: better on a broad
+    # 44-stock NASDAQ universe and on drawdowns, worse on the default 8-stock watchlist (2022-2026).
+    "use_regime_filter": False,     # no new entries while QQQ < SMA(regime_sma)
+    "regime_sma": 200,
+    "rank_by": "ml",                # "ml" (=probability, or no ranking when ML is off) | "momentum"
+    "momentum_filter": False,       # require 6-1 month momentum > min_momentum
+    "min_momentum": 0.0,
+    "momentum_lookback": 126,
+    "momentum_skip": 21,
+    "exit_chandelier": False,       # exit when close < highest high(N) - k*ATR
+    "chandelier_period": 22,
+    "chandelier_atr_mult": 3.0,
+    "exit_on_ema_cross": True,
     "atr_period": 14,
     "atr_stop_mult": 2.0,
     "exit_rsi_max": 80.0,           # exit if RSI above this (overextended); 0 disables
@@ -165,6 +180,10 @@ class Database:
                 v = int(v)
             elif isinstance(default, float):
                 v = float(v)
+            elif isinstance(default, str):
+                v = str(v)
+                if k == "rank_by" and v not in ("ml", "momentum"):
+                    continue
             if k in HARD_LIMITS:
                 v = max(0.0, min(v, HARD_LIMITS[k]))
             clean[k] = v

@@ -78,8 +78,9 @@ def test_entry_blocked_by_trend():
 
 
 def test_entry_blocked_by_ml():
-    assert evaluate(row(), P, False, 0.55).action == "HOLD"  # must be strictly > 0.55
-    assert evaluate(row(), P, False, None).action == "HOLD"  # no model => no entry
+    pm = dict(P, use_ml=True)  # ML filter is opt-in (off by default)
+    assert evaluate(row(), pm, False, 0.55).action == "HOLD"  # must be strictly > 0.55
+    assert evaluate(row(), pm, False, None).action == "HOLD"  # no model => no entry
 
 
 def test_ml_can_be_disabled():

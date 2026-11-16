@@ -69,4 +69,18 @@ def compute_indicators(df: pd.DataFrame, params: dict | None = None) -> pd.DataF
     out["trend_strength"] = (out["ema_fast"] - out["ema_slow"]) / out["atr"]
     out["dist_ema_fast"] = c / out["ema_fast"] - 1
     out["high_52w_dist"] = c / c.rolling(252, min_periods=60).max() - 1
+    # Cross-sectional momentum: ~6-month return that skips the most recent month
+    # (short-term reversal), the classic "12-1"/"6-1" momentum definition.
+    lb, skip = int(p.get("momentum_lookback", 126)), int(p.get("momentum_skip", 21))
+    out["mom_rank"] = c.shift(skip) / c.shift(skip + lb) - 1
+    # Chandelier exit level: highest high of the last N sessions minus k * ATR (stateless trailing stop).
+    out["chandelier"] = out["high"].rolling(int(p.get("chandelier_period", 22))).max() \
+        - float(p.get("chandelier_atr_mult", 3.0)) * out["atr"]
     return out
+
+
+def market_regime(benchmark: pd.DataFrame, period: int = 200) -> pd.Series:
+    """True when the benchmark (QQQ) closes above its simple moving average (risk-on regime)."""
+    c = benchmark["close"]
+    sma = c.rolling(period, min_periods=period).mean()
+    return (c > sma).where(sma.notna())

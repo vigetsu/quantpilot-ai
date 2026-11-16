@@ -18,8 +18,8 @@ import pandas as pd
 
 from quantpilot.analytics.performance import equity_metrics, trade_stats
 from quantpilot.risk.engine import effective_limits, position_size
-from quantpilot.strategy.indicators import compute_indicators
-from quantpilot.strategy.rules import evaluate
+from quantpilot.strategy.indicators import compute_indicators, market_regime
+from quantpilot.strategy.rules import evaluate, rank_score
 
 
 @dataclass
@@ -51,6 +51,15 @@ def run_backtest(bars: dict[str, pd.DataFrame], params: dict, initial_capital: f
         dates = [d for d in dates if d <= pd.Timestamp(end)]
     for s in ind:
         ind[s].index = pd.DatetimeIndex(ind[s].index)
+    if params.get("use_regime_filter", False):
+        reg = None
+        if benchmark is not None and len(benchmark):
+            b = benchmark.copy()
+            b.index = pd.DatetimeIndex(b.index)
+            reg = market_regime(b, int(params.get("regime_sma", 200)))
+        for s in ind:
+            # regime at close t uses QQQ data <= t only; acted on at t+1 open like every other signal
+            ind[s]["regime_ok"] = reg.reindex(ind[s].index) if reg is not None else np.nan
 
     cash = initial_capital
     positions: dict[str, dict] = {}
@@ -121,7 +130,7 @@ def run_backtest(bars: dict[str, pd.DataFrame], params: dict, initial_capital: f
             elif dec.action == "BUY" and sym not in positions and sym not in pending and not dd_blocked:
                 if sym in last_trade and (i - last_trade[sym]) < cooldown_days:
                     continue
-                candidates.append((prob if prob is not None else 0.0, sym, bar))
+                candidates.append((rank_score(prob, bar.to_dict(), params), sym, bar))
         pending_value = 0.0
         for prob, sym, bar in sorted(candidates, key=lambda x: -x[0]):
             price, a = float(bar["close"]), float(bar["atr"])
