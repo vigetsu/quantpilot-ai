@@ -143,7 +143,7 @@ def check_exit(symbol: str, state: PortfolioState, ctx: RiskContext) -> RiskDeci
         blockers.append("Piyasa kapalı")
     if not ctx.auto_trading or not ctx.bot_running or not ctx.safety_gate_ok:
         blockers.append("Otomatik emirler devre dışı / bot duraklatıldı")
-    if any(o["symbol"] == symbol and o.get("side") == "sell" and (o.get("order_type") or "") == "market"
+    if any(o["symbol"] == symbol and o.get("side") == "sell" and (o.get("order_type") or "") in ("market", "limit")
            for o in state.open_orders):
         blockers.append("Bekleyen satış emri var (çift emir engellendi)")
     if blockers:

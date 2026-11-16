@@ -39,7 +39,9 @@ class OrderExecutor:
         self._sleep = sleep
 
     def execute(self, decision: RiskDecision, symbol: str, side: str, client_order_id: str,
-                requested_price: float | None, reason: str, signal_id: int | None = None) -> ExecutionResult:
+                requested_price: float | None, reason: str, signal_id: int | None = None,
+                limit_price: float | None = None) -> ExecutionResult:
+        """Market order in the regular session; with ``limit_price`` an extended-hours DAY limit order."""
         if not isinstance(decision, RiskDecision) or not decision.approved or decision.qty < 1:
             return ExecutionResult(state="blocked", message="Risk motoru onayı yok")
         if side not in ("buy", "sell"):
@@ -58,11 +60,15 @@ class OrderExecutor:
             return ExecutionResult(state="duplicate", message="Emir Alpaca'da zaten mevcut", order=remote)
 
         if not self.db.create_intent(client_order_id=client_order_id, symbol=symbol, side=side, qty=decision.qty,
+                                     order_type="limit" if limit_price else "market",
                                      requested_price=requested_price, planned_stop=decision.stop_price,
                                      reason=reason, signal_id=signal_id):
             return ExecutionResult(state="duplicate", message="Eşzamanlı niyet tespit edildi")
         try:
-            order = self.broker.submit_market_order(symbol, decision.qty, side, client_order_id)
+            if limit_price:
+                order = self.broker.submit_extended_limit_order(symbol, decision.qty, side, limit_price, client_order_id)
+            else:
+                order = self.broker.submit_market_order(symbol, decision.qty, side, client_order_id)
         except OrderRejected as exc:
             self.db.update_intent(client_order_id, "rejected", error=str(exc))
             log.error("Emir reddedildi %s %s x%s: %s", side, symbol, decision.qty, exc)
@@ -99,9 +105,8 @@ class OrderExecutor:
             if qty < 1:
                 continue
             sym = p["symbol"]
-            stops = [o for o in open_orders if o["symbol"] == sym and o.get("side") == "sell"
-                     and o.get("order_type") in ("stop", "stop_limit", "trailing_stop")]
-            if stops:
+            # any open SELL (a stop, or an extended-hours exit/stop limit order) already holds these shares
+            if any(o["symbol"] == sym and o.get("side") == "sell" for o in open_orders):
                 continue
             buys = [o for o in self.db.orders(symbol=sym, limit=50)
                     if o.get("side") == "buy" and o.get("origin") == "quantpilot" and (o.get("filled_qty") or 0) > 0
@@ -132,6 +137,38 @@ class OrderExecutor:
                 log.error("Stop emri reddedildi %s: %s", sym, exc)
             except OrderOutcomeUnknown as exc:
                 self.db.update_intent(coid, "unknown", error=str(exc))
+        return actions
+
+    def software_stops(self, positions: list[dict], open_orders: list[dict], prices: dict[str, float],
+                       session_key: str, buffer_pct: float) -> list[str]:
+        """Outside regular hours broker stop orders do not trigger, so check the planned stop ourselves:
+        if the (fresh) price is at/below it, cancel the resting GTC stop and sell with an extended-hours limit."""
+        actions = []
+        for p in positions:
+            qty = int(p.get("qty") or 0)
+            sym = p["symbol"]
+            price = prices.get(sym)
+            if qty < 1 or price is None:
+                continue
+            buys = [o for o in self.db.orders(symbol=sym, limit=50)
+                    if o.get("side") == "buy" and o.get("origin") == "quantpilot" and (o.get("filled_qty") or 0) > 0
+                    and o.get("planned_stop")]
+            if not buys:
+                continue  # external/manual position: do not touch
+            stop = float(buys[0]["planned_stop"])
+            if price > stop:
+                continue
+            if any(o["symbol"] == sym and o.get("side") == "sell" and o.get("order_type") == "limit" for o in open_orders):
+                continue  # an exit limit order is already working
+            if not self.cancel_symbol_orders(sym, open_orders):
+                log.warning("%s yazılımsal stop: açık emirler iptal edilemedi", sym)
+                continue
+            from quantpilot.risk.engine import RiskDecision as _RD
+            coid = f"{buys[0]['client_order_id']}-xstop-{session_key}"
+            res = self.execute(_RD(True, qty, None, ["Yazılımsal stop"]), sym, "sell", coid, price,
+                               f"Seans dışı yazılımsal stop: fiyat {price:.2f} <= stop {stop:.2f}",
+                               limit_price=price * (1 - buffer_pct))
+            actions.append(f"{sym} yazılımsal stop {price:.2f}<={stop:.2f}: {res.get('state')}")
         return actions
 
     def cancel_symbol_orders(self, symbol: str, open_orders: list[dict], wait_s: float = 6.0) -> bool:

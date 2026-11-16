@@ -45,6 +45,35 @@ from quantpilot.ml.model import ModelTrainer, load_active_predictor  # noqa: E40
 from quantpilot.risk.selftest import run_self_test  # noqa: E402
 from quantpilot.scheduler.calendar import get_session, market_status_text  # noqa: E402
 from quantpilot.strategy.indicators import compute_indicators  # noqa: E402
+import quantpilot as _qp_pkg  # noqa: E402
+
+# Strategy keys added after the first cloud deploy. If the running process still has an older
+# quantpilot.db module loaded (see stale-code check below), its DEFAULT_PARAMS lacks these keys;
+# merging them here keeps the dashboard from crashing with KeyError until the app is rebooted.
+_PARAM_FALLBACKS = {
+    "use_ml": False, "use_regime_filter": False, "regime_sma": 200, "rank_by": "ml", "momentum_filter": False,
+    "min_momentum": 0.0, "momentum_lookback": 126, "momentum_skip": 21, "exit_chandelier": False,
+    "chandelier_period": 22, "chandelier_atr_mult": 3.0, "exit_on_ema_cross": True,
+    "extended_hours_trading": True, "extended_limit_buffer_pct": 0.003, "extended_max_price_age_min": 15,
+}
+
+
+def load_params(database) -> dict:
+    return {**_PARAM_FALLBACKS, **database.get_params()}
+
+
+def _disk_fingerprint() -> str:
+    """Same algorithm as quantpilot.code_fingerprint(), computed here because this script is always fresh."""
+    import hashlib
+    pkg = ROOT / "quantpilot"
+    h = hashlib.sha256()
+    for p in sorted(pkg.rglob("*.py")):
+        h.update(str(p.relative_to(pkg)).encode())
+        h.update(p.read_bytes())
+    return h.hexdigest()[:12]
+
+
+STALE_CODE = getattr(_qp_pkg, "LOADED_FINGERPRINT", None) != _disk_fingerprint()
 
 st.set_page_config(page_title="QuantPilot AI — NASDAQ Paper Trader", page_icon="📈", layout="wide",
                    initial_sidebar_state="auto")  # auto: collapsed on phones, open on desktop
@@ -255,7 +284,9 @@ elif _ai_mode == "builtin":
 else:
     _ai_label, _ai_cls = f"Ollama ({settings.ollama_model}): Çevrimdışı", "warn"
 p_ol = f"<span class='qp-pill {_ai_cls}'>{_ai_label}</span>"
-p_mkt = f"<span class='qp-pill {'ok' if (session and session.is_open) else 'neu'}'>ABD Piyasası: {market_status_text(session) if session else 'DEMO'}</span>"
+_phase = session.phase if session else "closed"
+_mkt_cls = {"regular": "ok", "pre": "warn", "post": "warn"}.get(_phase, "neu")
+p_mkt = f"<span class='qp-pill {_mkt_cls}'>ABD Piyasası: {market_status_text(session) if session else 'DEMO'}</span>"
 p_wrk = f"<span class='qp-pill {'ok' if w_alive else 'warn'}'>Worker: {w_text}</span>"
 p_auto = f"<span class='qp-pill {'ok' if (db.flag('auto_trading') and not db.flag('emergency_stop')) else 'bad'}'>Oto. Paper Emir: {'AÇIK' if (db.flag('auto_trading') and not db.flag('emergency_stop')) else 'KAPALI'}</span>"
 
@@ -268,6 +299,12 @@ st.markdown(f"""
   <div class="qp-pills">{p_alp}{p_ol}{p_mkt}{p_wrk}{p_auto}</div>
 </div>
 """, unsafe_allow_html=True)
+
+if STALE_CODE:
+    st.markdown("<div class='qp-banner stop'>🔄 <b>Uygulamanın yeniden başlatılması gerekiyor.</b> Yeni kod yüklendi, ancak "
+                "arka planda çalışan bot ve bazı modüller hâlâ <b>eski sürümle</b> çalışıyor; yeni strateji ayarları "
+                "uygulanmıyor ve bazı bölümler hata verebilir. share.streamlit.io → uygulamanın <b>⋮</b> menüsü → "
+                "<b>Reboot app</b> ile yeniden başlatın.</div>", unsafe_allow_html=True)
 
 if db.flag("emergency_stop"):
     st.markdown("<div class='qp-banner stop'>🛑 ACİL DURDURMA AKTİF — Tüm yeni emirler engellendi ve açık emirler iptal edildi. 'Bot Kontrolleri' sekmesinden kaldırabilirsiniz.</div>", unsafe_allow_html=True)
@@ -285,7 +322,7 @@ if alpaca_ok and not _dash_pw:
                 "<code>DASHBOARD_PASSWORD = \"güçlü-bir-şifre\"</code> ekleyin.</div>", unsafe_allow_html=True)
 
 _am_banner = db.active_model()
-if _am_banner and db.get_params().get("use_ml", True):
+if _am_banner and load_params(db).get("use_ml", True):
     try:
         _auc = (json.loads(_am_banner["metrics"]).get("oos_overall") or {}).get("roc_auc")
     except Exception:
@@ -309,6 +346,10 @@ with st.expander("ℹ️ Notlar ve sınırlamalar (açıklama modu, veri akış�
                 "olmazsa IEX'ten çekilir.")
     st.markdown("**Stop-loss:** Stop emri tetiklenince piyasa emrine dönüşür; fiyat boşluklarında (gap) stop fiyatından "
                 "dolum **garanti edilmez**.")
+    st.markdown("**Seans saatleri (Türkiye saati, kış):** seans öncesi 12:00–17:30 · normal seans 17:30–00:00 · "
+                "seans sonrası 00:00–04:00 (yaz saatinde 1 saat erken). Seans dışında bot yalnızca limit emir verir, "
+                "son işlem 15 dakikadan eskiyse emir vermez ve stop seviyesini kendisi kontrol eder. Strateji ve "
+                "backtest günlük kapanış verisiyle kurulduğu için seans dışı işlemler backtest'e yansımaz.")
 
 # ------------------------------------------------------------------ sidebar
 with st.sidebar:
@@ -545,7 +586,7 @@ with tabs[3]:
             raw = None
             st.warning(f"Fiyat verisi alınamadı: {exc}")
         if raw is not None and len(raw) > 60:
-            p_now = db.get_params()
+            p_now = load_params(db)
             ind_df = compute_indicators(raw, p_now).tail(n_bars)
             ef, es = int(p_now["ema_fast"]), int(p_now["ema_slow"])
             f_px = dark_fig(360)
@@ -635,7 +676,7 @@ with tabs[3]:
 with tabs[4]:
     st.markdown("<div class='qp-section'>🧪 Tarihsel Backtest ve Walk-Forward ML Model Eğitimi (SİMÜLASYON)</div>", unsafe_allow_html=True)
     st.caption("Backtest sonuçları **simülasyondur** ve gerçek Paper hesap metriklerinden tamamen ayrı tutulur. Emirler sinyal çubuğunun kapanışında değil, **ertesi günün açılışında** kayma (slippage) ve komisyon uygulanarak simüle edilir.")
-    params = db.get_params()
+    params = load_params(db)
     b1, b2, b3 = st.columns(3)
     days_bt = b1.slider("Tarihsel Veri Penceresi (gün)", 400, 1825, 1100, 50)
     use_ml_bt = b2.checkbox("Backtest'te Walk-Forward ML Olasılıklarını Kullan", value=bool(params["use_ml"]))
@@ -724,7 +765,7 @@ with tabs[4]:
 # ======================================================= TAB 5: F
 with tabs[5]:
     st.markdown("<div class='qp-section'>Bot Kontrolleri, Güvenlik Kapısı, Risk Limitleri ve İzleme Listesi</div>", unsafe_allow_html=True)
-    params = db.get_params()
+    params = load_params(db)
     gate_ok, gate_msgs = (cached_safety_gate(db, broker, json.dumps(params, sort_keys=True, default=str)) if broker
                           else (False, ["❌ Alpaca Paper API bağlantısı yok (.env)"]))
     st.markdown("**Otomatik Paper Emir Ön Koşulları (Güvenlik Kapısı)**")
@@ -785,6 +826,11 @@ with tabs[5]:
         rank_mom = g1.checkbox("Momentuma göre sırala", value=params["rank_by"] == "momentum", help="Nakit/maruziyet sınırlıyken önce son 6 ayda (son ay hariç) en çok yükselen hisseler alınır.")
         mom_filter = g2.checkbox("Pozitif momentum şartı", value=bool(params["momentum_filter"]), help="Yalnızca 6 aylık (son ay hariç) getirisi pozitif hisseler alınır. Testlerde fayda göstermedi.")
         exit_ema = g2.checkbox("EMA kesişiminde sat", value=bool(params["exit_on_ema_cross"]))
+        ext_on = g3.checkbox("Seans öncesi/sonrası işlem", value=bool(params["extended_hours_trading"]),
+                             help="Seans öncesi (TSİ 12:00–17:30) ve sonrası (TSİ 00:00–04:00) da işlem yapar. "
+                                  "Bu saatlerde yalnızca limit emir verilir (son fiyat ±%0,3), son işlem 15 dakikadan "
+                                  "eskiyse emir verilmez; broker stop emirleri tetiklenmediği için stop seviyesi bot "
+                                  "tarafından her döngüde kontrol edilir. Hacim düşük, fiyat farkları geniştir.")
         exit_ch = g3.checkbox("İz süren stop (Chandelier)", value=bool(params["exit_chandelier"]), help="Kapanış, son 22 günün en yüksek fiyatı − 3×ATR seviyesinin altına inerse ertesi gün satılır.")
         if st.form_submit_button("💾 Parametreleri Kaydet"):
             if not exit_ema and not exit_ch:
@@ -795,7 +841,8 @@ with tabs[5]:
                            "place_stop_orders": place_stops, "max_position_pct": max_pos, "max_exposure_pct": max_exp,
                            "max_risk_per_trade_pct": max_rsk, "max_daily_drawdown_pct": max_dd, "cooldown_minutes": cooldown,
                            "use_regime_filter": use_regime, "rank_by": "momentum" if rank_mom else "ml",
-                           "momentum_filter": mom_filter, "exit_on_ema_cross": exit_ema, "exit_chandelier": exit_ch})
+                           "momentum_filter": mom_filter, "exit_on_ema_cross": exit_ema, "exit_chandelier": exit_ch,
+                           "extended_hours_trading": ext_on})
             st.success("Parametreler kaydedildi.")
             st.rerun()
 
@@ -825,7 +872,7 @@ with tabs[5]:
 # ======================================================= TAB 6: G
 with tabs[6]:
     st.markdown("<div class='qp-section'>Sistem Durumu, Öz-Test ve Hata Kayıtları</div>", unsafe_allow_html=True)
-    st_ok, st_msgs = run_self_test(db.get_params())
+    st_ok, st_msgs = run_self_test(load_params(db))
     s1, s2 = st.columns(2)
     with s1:
         st.markdown("**Bağlantı ve Zamanlayıcı Durumu**")
